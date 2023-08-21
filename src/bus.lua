@@ -2,18 +2,32 @@ local queue = require 'fibers.queue'
 local op = require 'fibers.op'
 local sleep = require 'fibers.sleep'
 
+local CREDS = {
+    ['user'] = 'pass',
+    ['user1'] = 'pass1',
+    ['user2'] = 'pass2',
+}
+
 local Bus = {}
 Bus.__index = Bus
 
 function Bus.new(q_length)
-    return setmetatable({q_length = q_length, topics = {}}, Bus)
+    return setmetatable({
+        q_length = q_length,
+        topics = {},
+        retained_messages = {}
+    }, Bus)
 end
 
 local Subscription = {}
 Subscription.__index = Subscription
 
 function Subscription.new(conn, topic, q)
-    return setmetatable({connection = conn, topic = topic, q = q}, Subscription)
+    return setmetatable({
+        connection = conn,
+        topic = topic,
+        q = q
+    }, Subscription)
 end
 
 function Subscription:next_msg(timeout)
@@ -70,25 +84,26 @@ function Connection:disconnect()
 end
 
 function Bus:connect(creds)
-    if creds.username == 'user' and creds.password == 'pass' then
+    if CREDS[creds.username] == creds.password then
         return Connection.new(self)
     else
         return nil, 'Authentication failed'
     end
 end
 
+-- Bus:subscribe function
 function Bus:subscribe(connection, topic)
     local q = queue.new(self.q_length)
 
     if not self.topics[topic] then
-        self.topics[topic] = {subscribers = {}, retained = nil}
+        self.topics[topic] = {subscribers = {}}
     end
 
     local subscription = Subscription.new(connection, topic, q)
     table.insert(self.topics[topic].subscribers, subscription)
 
-    if self.topics[topic].retained then
-        local put_operation = subscription.q:put_op(self.topics[topic].retained)
+    if self.retained_messages[topic] then
+        local put_operation = subscription.q:put_op(self.retained_messages[topic])
         put_operation:perform_alt(function ()
             print 'QUEUE FULL, not sent'
         end)
@@ -97,23 +112,24 @@ function Bus:subscribe(connection, topic)
     return subscription
 end
 
+-- Bus:publish function
 function Bus:publish(message)
-    local topic_data = self.topics[message.topic] or {subscribers = {}, retained = nil}
+    local topic_data = self.topics[message.topic] or {subscribers = {}}
     self.topics[message.topic] = topic_data
 
     if message.retained then
-        topic_data.retained = message
+        self.retained_messages[message.topic] = message
     end
     
     for _, subscription in ipairs(topic_data.subscribers) do
         local put_operation = subscription.q:put_op(message)
         put_operation:perform_alt(function ()
             -- TODO: log this properly
-            print 'QUEUE FULL, not sent'
         end)
     end
 end
 
+-- Bus:unsubscribe function
 function Bus:unsubscribe(topic, subscription)
     local topic_data = self.topics[topic]
     if not topic_data then
@@ -127,8 +143,11 @@ function Bus:unsubscribe(topic, subscription)
         end
     end
 
-    if #topic_data.subscribers == 0 and not topic_data.retained then
+    if #topic_data.subscribers == 0 then
         self.topics[topic] = nil
+        if not self.retained_messages[topic] then
+            self.retained_messages[topic] = nil
+        end
     end
 end
 
