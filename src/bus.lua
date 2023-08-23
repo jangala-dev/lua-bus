@@ -1,6 +1,9 @@
 local queue = require 'fibers.queue'
 local op = require 'fibers.op'
 local sleep = require 'fibers.sleep'
+local trie = require 'trie'
+
+local DEFAULT_Q_LEN = 10
 
 local CREDS = {
     ['user'] = 'pass',
@@ -11,11 +14,12 @@ local CREDS = {
 local Bus = {}
 Bus.__index = Bus
 
-function Bus.new(q_length)
+function Bus.new(params)
+    params = params or {}
     return setmetatable({
-        q_length = q_length,
-        topics = {},
-        retained_messages = {}
+        q_length = params.q_length or DEFAULT_Q_LEN,
+        topics = trie.new(params.s_wild, params.m_wild, params.sep), --sets single_wild, multi_wild, separator
+        retained_messages = trie.new(params.s_wild, params.m_wild, params.sep)
     }, Bus)
 end
 
@@ -40,7 +44,7 @@ function Subscription:next_msg(timeout)
     else
         msg = self.q:get()
     end
-    return msg or nil, "Timeout"
+    if msg then return msg else return nil, "Timeout" end
 end
 
 function Subscription:unsubscribe()
@@ -68,7 +72,7 @@ end
 function Connection:unsubscribe(topic, subscription)
     self.bus:unsubscribe(topic, subscription)
 
-    for i, sub in ipairs(self.subscriptions) do
+    for i, sub in ipairs(self.subscriptions) do -- slow O(n)
         if sub == subscription then
             table.remove(self.subscriptions, i)
             return
@@ -84,7 +88,7 @@ function Connection:disconnect()
 end
 
 function Bus:connect(creds)
-    if CREDS[creds.username] == creds.password then
+    if CREDS[creds.username] == creds.password then -- production ready!
         return Connection.new(self)
     else
         return nil, 'Authentication failed'
@@ -93,61 +97,64 @@ end
 
 -- Bus:subscribe function
 function Bus:subscribe(connection, topic)
-    local q = queue.new(self.q_length)
-
-    if not self.topics[topic] then
-        self.topics[topic] = {subscribers = {}}
-    end
-
-    local subscription = Subscription.new(connection, topic, q)
-    table.insert(self.topics[topic].subscribers, subscription)
-
-    if self.retained_messages[topic] then
-        local put_operation = subscription.q:put_op(self.retained_messages[topic])
-        put_operation:perform_alt(function ()
-            print 'QUEUE FULL, not sent'
-        end)
+    -- get topic from the trie, or make and add to the trie
+    local topic_entry = self.topics:retrieve(topic)
+    if not topic_entry then
+        topic_entry = {subs = {}}
+        self.topics:insert(topic, topic_entry)
     end
     
+    -- create the subscription - we have no identity yet, UUID?
+    local q = queue.new(self.q_length)
+    local subscription = Subscription.new(connection, topic, q)
+    table.insert(topic_entry.subs, subscription)
+
+    -- send any relevant retained messages
+    for _, v in ipairs(self.retained_messages:match(topic)) do  -- wildcard search in trie
+        local put_operation = subscription.q:put_op(v.value)
+        put_operation:perform_alt(function ()
+            -- print 'QUEUE FULL, not sent' --need to log blocked queue properly
+        end)
+    end
+
     return subscription
 end
 
 -- Bus:publish function
 function Bus:publish(message)
-    local topic_data = self.topics[message.topic] or {subscribers = {}}
-    self.topics[message.topic] = topic_data
+    local matches = self.topics:match(message.topic)
+    for _, topic_entry in ipairs(matches) do
+        for _, sub in ipairs(topic_entry.value.subs) do
+            local put_operation = sub.q:put_op(message)
+            put_operation:perform_alt(function ()
+                -- TODO: log this properly
+            end)
+        end
+        -- add logic here for nats style q_subs if we go this route
+    end
 
     if message.retained then
-        self.retained_messages[message.topic] = message
-    end
-    
-    for _, subscription in ipairs(topic_data.subscribers) do
-        local put_operation = subscription.q:put_op(message)
-        put_operation:perform_alt(function ()
-            -- TODO: log this properly
-        end)
+        if not message.payload then  -- send msg with empty payload + ret flag to clear ret message
+            self.retained_messages:delete(message.topic)
+        else
+            self.retained_messages:insert(message.topic, message)
+        end
     end
 end
 
 -- Bus:unsubscribe function
 function Bus:unsubscribe(topic, subscription)
-    local topic_data = self.topics[topic]
-    if not topic_data then
-        return
-    end
-    
-    for i, sub in ipairs(topic_data.subscribers) do
+    local topic_entry = self.topics:retrieve(topic)
+    assert(topic_entry, "error: unsubscribing from a non-existent topic")
+
+    for i, sub in ipairs(topic_entry.subs) do  -- slow O(n)
         if sub == subscription then
-            table.remove(topic_data.subscribers, i)
-            return
+            table.remove(topic_entry.subs, i)
         end
     end
 
-    if #topic_data.subscribers == 0 then
-        self.topics[topic] = nil
-        if not self.retained_messages[topic] then
-            self.retained_messages[topic] = nil
-        end
+    if #topic_entry.subs == 0 then
+        self.topics:delete(topic)
     end
 end
 

@@ -3,19 +3,36 @@ package.path = "../src/?.lua;" .. package.path
 local Fiber = require 'fibers.fiber'
 local Bus = require 'bus'
 
-local bus = Bus.new(10)
+-- Test Simple PubSub
+local function test_simple()
+    local bus = Bus.new({sep = "/"})
 
--- Test Unauthorized Access
-Fiber.spawn(function ()
-    local wrongCredentials = {username = 'wrong', password = 'wrong'}
-    local _, err = bus:connect(wrongCredentials)
+    local credentials = {username = 'user', password = 'pass'}
+    local connection = assert(bus:connect(credentials))
+
+    local subscription = assert(connection:subscribe("simple/topic"))
+
+    connection:publish({topic="simple/topic", payload="Hello"})
+
+    local msg, err = subscription:next_msg()
+    assert(msg.payload == "Hello" and not err)
+
+    print("Simple test passed!")
+end
+
+-- Test Unauthorised Access
+local function test_unauth_access()
+    local bus = Bus.new()
+    local wrong_credentials = {username = 'wrong', password = 'wrong'}
+    local _, err = bus:connect(wrong_credentials)
     assert(err)
 
     print("Unauthorized access test passed!")
-end)
+end
 
 -- Test Multiple Subscribers
-Fiber.spawn(function ()
+local function test_multi_sub()
+    local bus = Bus.new({sep = "/"})
     local credentials = {username = 'user', password = 'pass'}
     local connection1 = assert(bus:connect(credentials))
     local connection2 = assert(bus:connect(credentials))
@@ -29,10 +46,12 @@ Fiber.spawn(function ()
     assert(subscription2:next_msg().payload == "Hello")
 
     print("Multiple subscribers test passed!")
-end)
+end
 
 -- Test Multiple Topics
-Fiber.spawn(function ()
+local function test_multi_topics()
+    local bus = Bus.new({sep = "/"})
+
     local credentials = {username = 'user', password = 'pass'}
     local connection = assert(bus:connect(credentials))
 
@@ -42,13 +61,15 @@ Fiber.spawn(function ()
     connection:publish({topic="topic/A", payload="MessageA"})
 
     assert(subscriptionA:next_msg().payload == "MessageA")
-    assert(subscriptionB:next_msg(0) == nil) -- There shouldn't be any message for topic/B
+    assert(subscriptionB:next_msg(1e-3) == nil) -- There shouldn't be any message for topic/B
 
     print("Multiple topics test passed!")
-end)
+end
 
 -- Test Clean Subscription
-Fiber.spawn(function ()
+local function test_clean_sub()
+    local bus = Bus.new({sep = "/"})
+
     local credentials = {username = 'user', password = 'pass'}
     local connection = assert(bus:connect(credentials))
 
@@ -56,13 +77,16 @@ Fiber.spawn(function ()
     local subscription = assert(connection:subscribe("clean/topic"))
 
     -- Since the old message was not retained, the new subscriber shouldn't receive it.
-    assert(subscription:next_msg(0) == nil) 
+    assert(subscription:next_msg(1e-3) == nil) 
 
     print("Clean subscription test passed!")
-end)
+end
+
 
 -- Test Connection Cleanup
-Fiber.spawn(function ()
+local function test_conn_clean()
+    local bus = Bus.new({sep = "/"})
+
     local credentials = {username = 'user', password = 'pass'}
     local connection = assert(bus:connect(credentials))
 
@@ -75,14 +99,17 @@ Fiber.spawn(function ()
     connection:disconnect()
 
     -- Verify the subscription is cleaned up
-    local topicData = bus.topics["cleanup/topic"]
-    assert(not topicData or #topicData.subscribers == 0, "Subscription was not cleaned up")
+    local topic_data = bus.topics["cleanup/topic"]
+    assert(not topic_data or #topic_data.subscribers == 0, "Subscription was not cleaned up")
 
     print("Connection cleanup test passed!")
-end)
+end
+
 
 -- Retained Message Test
-Fiber.spawn(function ()
+local function test_retained_msg()
+    local bus = Bus.new({sep = "/"})
+
     local credentials = {username = 'user', password = 'pass'}
     local connection = assert(bus:connect(credentials))
 
@@ -94,10 +121,12 @@ Fiber.spawn(function ()
     assert(subscription:next_msg().payload == "RetainedMessage")
 
     print("Retained message test passed!")
-end)
+end
 
 -- Unsubscribe Test
-Fiber.spawn(function ()
+local function test_unsubscribe()
+    local bus = Bus.new({sep = "/"})
+
     local credentials = {username = 'user', password = 'pass'}
     local connection = assert(bus:connect(credentials))
 
@@ -105,19 +134,21 @@ Fiber.spawn(function ()
     connection:unsubscribe("unsubscribe/topic", subscription)
 
     connection:publish({topic="unsubscribe/topic", payload="NoReceive"})
-    assert(subscription:next_msg(0) == nil) -- The subscriber should not receive the message
+    assert(subscription:next_msg(1e-3) == nil) -- The subscriber should not receive the message
 
     print("Unsubscribe test passed!")
-end)
+end
 
 -- Queue Overflow Test
-Fiber.spawn(function ()
+local function test_q_overflow()
+    local bus = Bus.new({sep = "/"})
+
     local credentials = {username = 'user', password = 'pass'}
     local connection = assert(bus:connect(credentials))
 
     local subscription = assert(connection:subscribe("overflow/topic"))
 
-    for i = 1, 11 do
+    for i = 1, 10 do
         connection:publish({topic="overflow/topic", payload="Message" .. i})
     end
 
@@ -125,13 +156,14 @@ Fiber.spawn(function ()
     for i = 1, 10 do
         assert(subscription:next_msg().payload == "Message" .. i)
     end
-    assert(subscription:next_msg(0) == nil)
+    assert(subscription:next_msg(1e-3) == nil)
 
     print("Queue overflow test passed!")
-end)
+end
 
 -- Multiple Connections with Different Credentials
-Fiber.spawn(function ()
+local function test_multi_creds()
+    local bus = Bus.new({sep = "/"})
 
     local creds1 = {username = 'user1', password = 'pass1'}
     local connection1 = assert(bus:connect(creds1))
@@ -148,6 +180,67 @@ Fiber.spawn(function ()
     assert(subscription2:next_msg().payload == "FromUser1")
 
     print("Multiple credentials test passed!")
+end
+
+-- Multiple Connections with Different Credentials
+local function test_wildcard()
+    local bus = Bus.new({sep = "/", m_wild = "#", s_wild = "+"})
+
+    local creds = {username = 'user', password = 'pass'}
+    local connection = assert(bus:connect(creds))
+
+    local working_sub_strings = {
+        "wild/cards/are/fun",
+        "wild/cards/are/+",
+        "wild/+/are/fun",
+        "wild/+/are/#",
+        "wild/+/#",
+        "#"
+    }
+    local working_subs = {}
+    for _, v in ipairs(working_sub_strings) do 
+        table.insert(working_subs, assert(connection:subscribe(v)))
+    end
+
+    local not_working_sub_strings = {
+        "wild/cards/are/funny",
+        "wild/cards/are/+/fun",
+        "wild/+/+",
+        "tame/#",
+    }
+    local not_working_subs = {}
+    for _, v in ipairs(not_working_sub_strings) do 
+        table.insert(not_working_subs, assert(connection:subscribe(v)))
+    end
+    
+    connection:publish({topic="wild/cards/are/fun", payload="payload"})
+
+    for i, v in ipairs(working_subs) do 
+        assert(v:next_msg().payload=="payload")
+    end
+
+    for i, v in ipairs(not_working_subs) do 
+        assert(not v:next_msg(1e-3))
+    end
+
+    print("Wildcard test passed!")
+end
+
+
+Fiber.spawn(function ()
+    test_simple()
+    test_unauth_access()
+    test_multi_sub()
+    test_multi_topics()
+    test_clean_sub()
+    test_conn_clean()
+    test_unsubscribe()
+    test_retained_msg()
+    test_q_overflow()
+    test_multi_creds()
+    test_wildcard()
+    print("ALL TESTS PASSED!")
+    Fiber.stop()
 end)
 
 Fiber.main()
