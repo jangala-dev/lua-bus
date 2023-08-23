@@ -29,7 +29,7 @@ end)
 
 ## Features
 
-- **Efficient Storage and Retrieval**: The module utilizes trie-based structures from our `trie` module for effective message and topic storage.
+- **Efficient Storage and Retrieval**: The module uses our `trie` module for effective message and topic storage.
   
 - **Wildcard Capabilities**: The system supports single and multiple wildcard subscriptions, allowing for flexible topic matching.
 
@@ -41,7 +41,7 @@ end)
 
 ## Usage
 
-### Initialization
+### Initialisation
 
 To create a new Bus:
 
@@ -110,7 +110,7 @@ connection:disconnect()
 
 ## Technical Details
 
-- The module uses `fibers.queue`, `fibers.op`, and `fibers.sleep` for asynchronous operations.
+- The module uses `fibers` for asynchronous operations.
 
 - `Subscription:next_msg(timeout)` retrieves the next message from a subscription. If a timeout is provided, it will wait up to that duration for a message.
 
