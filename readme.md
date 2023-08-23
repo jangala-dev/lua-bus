@@ -5,6 +5,9 @@
 The `Bus` module provides a lightweight messaging and subscription system, using tries to provide efficient wildcard subscriptions and retained message delivery. It is built on lua-fibers.
 
 ``` lua
+-- Create a new Bus
+local bus = Bus.new({s_wild='+', m_wild='#', sep = '/'})
+
 -- Fiber 1: Publisher
 Fiber.spawn(function()
     -- Create a connection and publish to a topic
