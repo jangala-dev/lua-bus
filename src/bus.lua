@@ -64,9 +64,10 @@ function Connection:publish(message)
 end
 
 function Connection:subscribe(topic)
-    local subscription = self.bus:subscribe(self, topic)
+    local subscription, err = self.bus:subscribe(self, topic)
+    if err then return nil, err end
     table.insert(self.subscriptions, subscription)
-    return subscription
+    return subscription, nil
 end
 
 function Connection:unsubscribe(topic, subscription)
@@ -98,7 +99,8 @@ end
 -- Bus:subscribe function
 function Bus:subscribe(connection, topic)
     -- get topic from the trie, or make and add to the trie
-    local topic_entry = self.topics:retrieve(topic)
+    local topic_entry, err = self.topics:retrieve(topic)
+    if err ~= nil then return nil, err end
     if not topic_entry then
         topic_entry = {subs = {}}
         self.topics:insert(topic, topic_entry)
