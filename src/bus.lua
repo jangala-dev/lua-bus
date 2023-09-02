@@ -14,7 +14,7 @@ local CREDS = {
 local Bus = {}
 Bus.__index = Bus
 
-function Bus.new(params)
+local function new(params)
     params = params or {}
     return setmetatable({
         q_length = params.q_length or DEFAULT_Q_LEN,
@@ -54,8 +54,8 @@ end
 local Connection = {}
 Connection.__index = Connection
 
-function Connection.new(bus, creds)
-    return setmetatable({bus = bus, creds = creds, subscriptions = {}}, Connection)
+function Connection.new(bus)
+    return setmetatable({bus = bus, subscriptions = {}}, Connection)
 end
 
 function Connection:publish(message)
@@ -87,8 +87,8 @@ function Connection:disconnect()
     self.subscriptions = {}
 end
 
-function Bus:connect(creds)
-    if CREDS[creds.username] == creds.password then -- production ready!
+function Bus:connect(username, password)
+    if CREDS[username] == password then -- production ready!
         return Connection.new(self)
     else
         return nil, 'Authentication failed'
@@ -158,4 +158,6 @@ function Bus:unsubscribe(topic, subscription)
     end
 end
 
-return Bus
+return {
+    new = new
+}

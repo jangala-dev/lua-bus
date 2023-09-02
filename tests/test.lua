@@ -7,8 +7,7 @@ local Bus = require 'bus'
 local function test_simple()
     local bus = Bus.new({sep = "/"})
 
-    local credentials = {username = 'user', password = 'pass'}
-    local connection = assert(bus:connect(credentials))
+    local connection = assert(bus:connect('user', 'pass'))
 
     local subscription = assert(connection:subscribe("simple/topic"))
 
@@ -23,8 +22,7 @@ end
 -- Test Unauthorised Access
 local function test_unauth_access()
     local bus = Bus.new()
-    local wrong_credentials = {username = 'wrong', password = 'wrong'}
-    local _, err = bus:connect(wrong_credentials)
+    local _, err = bus:connect('wrong', 'wrong')
     assert(err)
 
     print("Unauthorized access test passed!")
@@ -33,9 +31,8 @@ end
 -- Test Multiple Subscribers
 local function test_multi_sub()
     local bus = Bus.new({sep = "/"})
-    local credentials = {username = 'user', password = 'pass'}
-    local connection1 = assert(bus:connect(credentials))
-    local connection2 = assert(bus:connect(credentials))
+    local connection1 = assert(bus:connect('user', 'pass'))
+    local connection2 = assert(bus:connect('user', 'pass'))
 
     local subscription1 = assert(connection1:subscribe("multi/topic"))
     local subscription2 = assert(connection2:subscribe("multi/topic"))
@@ -52,8 +49,7 @@ end
 local function test_multi_topics()
     local bus = Bus.new({sep = "/"})
 
-    local credentials = {username = 'user', password = 'pass'}
-    local connection = assert(bus:connect(credentials))
+    local connection = assert(bus:connect('user', 'pass'))
 
     local subscriptionA = assert(connection:subscribe("topic/A"))
     local subscriptionB = assert(connection:subscribe("topic/B"))
@@ -70,8 +66,7 @@ end
 local function test_clean_sub()
     local bus = Bus.new({sep = "/"})
 
-    local credentials = {username = 'user', password = 'pass'}
-    local connection = assert(bus:connect(credentials))
+    local connection = assert(bus:connect('user', 'pass'))
 
     connection:publish({topic="clean/topic", payload="OldMessage"})
     local subscription = assert(connection:subscribe("clean/topic"))
@@ -87,8 +82,7 @@ end
 local function test_conn_clean()
     local bus = Bus.new({sep = "/"})
 
-    local credentials = {username = 'user', password = 'pass'}
-    local connection = assert(bus:connect(credentials))
+    local connection = assert(bus:connect('user', 'pass'))
 
     local subscription = assert(connection:subscribe("cleanup/topic"))
 
@@ -110,8 +104,7 @@ end
 local function test_retained_msg()
     local bus = Bus.new({sep = "/"})
 
-    local credentials = {username = 'user', password = 'pass'}
-    local connection = assert(bus:connect(credentials))
+    local connection = assert(bus:connect('user', 'pass'))
 
     -- Publish a retained message
     connection:publish({topic="retained/topic", payload="RetainedMessage", retained=true})
@@ -127,8 +120,7 @@ end
 local function test_unsubscribe()
     local bus = Bus.new({sep = "/"})
 
-    local credentials = {username = 'user', password = 'pass'}
-    local connection = assert(bus:connect(credentials))
+    local connection = assert(bus:connect('user', 'pass'))
 
     local subscription = assert(connection:subscribe("unsubscribe/topic"))
     connection:unsubscribe("unsubscribe/topic", subscription)
@@ -143,8 +135,7 @@ end
 local function test_q_overflow()
     local bus = Bus.new({sep = "/"})
 
-    local credentials = {username = 'user', password = 'pass'}
-    local connection = assert(bus:connect(credentials))
+    local connection = assert(bus:connect('user', 'pass'))
 
     local subscription = assert(connection:subscribe("overflow/topic"))
 
@@ -165,12 +156,10 @@ end
 local function test_multi_creds()
     local bus = Bus.new({sep = "/"})
 
-    local creds1 = {username = 'user1', password = 'pass1'}
-    local connection1 = assert(bus:connect(creds1))
+    local connection1 = assert(bus:connect('user1', 'pass1'))
     local subscription1 = assert(connection1:subscribe("multi/creds/2"))
     
-    local creds2 = {username = 'user2', password = 'pass2'}
-    local connection2 = assert(bus:connect(creds2))
+    local connection2 = assert(bus:connect('user2', 'pass2'))
     local subscription2 = assert(connection2:subscribe("multi/creds/1"))
     
     connection1:publish({topic="multi/creds/1", payload="FromUser1"})
@@ -186,8 +175,7 @@ end
 local function test_wildcard()
     local bus = Bus.new({sep = "/", m_wild = "#", s_wild = "+"})
 
-    local creds = {username = 'user', password = 'pass'}
-    local connection = assert(bus:connect(creds))
+    local connection = assert(bus:connect('user', 'pass'))
 
     local working_sub_strings = {
         "wild/cards/are/fun",
