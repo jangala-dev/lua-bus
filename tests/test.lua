@@ -123,7 +123,7 @@ local function test_unsubscribe()
     local connection = assert(bus:connect('user', 'pass'))
 
     local subscription = assert(connection:subscribe("unsubscribe/topic"))
-    connection:unsubscribe("unsubscribe/topic", subscription)
+    subscription:unsubscribe()
 
     connection:publish({topic="unsubscribe/topic", payload="NoReceive"})
     assert(subscription:next_msg(1e-3) == nil) -- The subscriber should not receive the message
@@ -171,7 +171,7 @@ local function test_multi_creds()
     print("Multiple credentials test passed!")
 end
 
--- Multiple Connections with Different Credentials
+-- Wildcard Test
 local function test_wildcard()
     local bus = Bus.new({sep = "/", m_wild = "#", s_wild = "+"})
 
@@ -186,8 +186,9 @@ local function test_wildcard()
         "#"
     }
     local working_subs = {}
-    for _, v in ipairs(working_sub_strings) do 
-        table.insert(working_subs, assert(connection:subscribe(v)))
+    for _, v in ipairs(working_sub_strings) do
+        local sub, _ = assert(connection:subscribe(v))
+        table.insert(working_subs, sub)
     end
 
     local not_working_sub_strings = {
@@ -197,8 +198,9 @@ local function test_wildcard()
         "tame/#",
     }
     local not_working_subs = {}
-    for _, v in ipairs(not_working_sub_strings) do 
-        table.insert(not_working_subs, assert(connection:subscribe(v)))
+    for _, v in ipairs(not_working_sub_strings) do
+        local sub, _ = assert(connection:subscribe(v))
+        table.insert(not_working_subs, sub)
     end
     
     connection:publish({topic="wild/cards/are/fun", payload="payload"})
