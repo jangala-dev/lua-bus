@@ -139,7 +139,7 @@ local function test_q_overflow()
 
     local subscription = assert(connection:subscribe("overflow/topic"))
 
-    for i = 1, 10 do
+    for i = 1, 11 do
         connection:publish({topic="overflow/topic", payload="Message" .. i})
     end
 
