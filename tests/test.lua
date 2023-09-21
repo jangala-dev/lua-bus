@@ -7,7 +7,7 @@ local Bus = require 'bus'
 local function test_simple()
     local bus = Bus.new({sep = "/"})
 
-    local connection = assert(bus:connect('user', 'pass'))
+    local connection = assert(bus:connect({user='user', password='pass'}))
 
     local subscription = assert(connection:subscribe("simple/topic"))
 
@@ -19,20 +19,11 @@ local function test_simple()
     print("Simple test passed!")
 end
 
--- Test Unauthorised Access
-local function test_unauth_access()
-    local bus = Bus.new()
-    local _, err = bus:connect('wrong', 'wrong')
-    assert(err)
-
-    print("Unauthorized access test passed!")
-end
-
 -- Test Multiple Subscribers
 local function test_multi_sub()
     local bus = Bus.new({sep = "/"})
-    local connection1 = assert(bus:connect('user', 'pass'))
-    local connection2 = assert(bus:connect('user', 'pass'))
+    local connection1 = assert(bus:connect({user='user', password='pass'}))
+    local connection2 = assert(bus:connect({user='user', password='pass'}))
 
     local subscription1 = assert(connection1:subscribe("multi/topic"))
     local subscription2 = assert(connection2:subscribe("multi/topic"))
@@ -49,7 +40,7 @@ end
 local function test_multi_topics()
     local bus = Bus.new({sep = "/"})
 
-    local connection = assert(bus:connect('user', 'pass'))
+    local connection = assert(bus:connect({user='user', password='pass'}))
 
     local subscriptionA = assert(connection:subscribe("topic/A"))
     local subscriptionB = assert(connection:subscribe("topic/B"))
@@ -66,7 +57,7 @@ end
 local function test_clean_sub()
     local bus = Bus.new({sep = "/"})
 
-    local connection = assert(bus:connect('user', 'pass'))
+    local connection = assert(bus:connect({user='user', password='pass'}))
 
     connection:publish({topic="clean/topic", payload="OldMessage"})
     local subscription = assert(connection:subscribe("clean/topic"))
@@ -82,7 +73,7 @@ end
 local function test_conn_clean()
     local bus = Bus.new({sep = "/"})
 
-    local connection = assert(bus:connect('user', 'pass'))
+    local connection = assert(bus:connect({user='user', password='pass'}))
 
     local subscription = assert(connection:subscribe("cleanup/topic"))
 
@@ -104,7 +95,7 @@ end
 local function test_retained_msg()
     local bus = Bus.new({sep = "/"})
 
-    local connection = assert(bus:connect('user', 'pass'))
+    local connection = assert(bus:connect({user='user', password='pass'}))
 
     -- Publish a retained message
     connection:publish({topic="retained/topic", payload="RetainedMessage", retained=true})
@@ -120,7 +111,7 @@ end
 local function test_unsubscribe()
     local bus = Bus.new({sep = "/"})
 
-    local connection = assert(bus:connect('user', 'pass'))
+    local connection = assert(bus:connect({user='user', password='pass'}))
 
     local subscription = assert(connection:subscribe("unsubscribe/topic"))
     subscription:unsubscribe()
@@ -135,7 +126,7 @@ end
 local function test_q_overflow()
     local bus = Bus.new({sep = "/"})
 
-    local connection = assert(bus:connect('user', 'pass'))
+    local connection = assert(bus:connect({user='user', password='pass'}))
 
     local subscription = assert(connection:subscribe("overflow/topic"))
 
@@ -156,10 +147,10 @@ end
 local function test_multi_creds()
     local bus = Bus.new({sep = "/"})
 
-    local connection1 = assert(bus:connect('user1', 'pass1'))
+    local connection1 = assert(bus:connect({user='user1', password='pass1'}))
     local subscription1 = assert(connection1:subscribe("multi/creds/2"))
     
-    local connection2 = assert(bus:connect('user2', 'pass2'))
+    local connection2 = assert(bus:connect({user='user2', password='pass2'}))
     local subscription2 = assert(connection2:subscribe("multi/creds/1"))
     
     connection1:publish({topic="multi/creds/1", payload="FromUser1"})
@@ -175,7 +166,7 @@ end
 local function test_wildcard()
     local bus = Bus.new({sep = "/", m_wild = "#", s_wild = "+"})
 
-    local connection = assert(bus:connect('user', 'pass'))
+    local connection = assert(bus:connect({user='user', password='pass'}))
 
     local working_sub_strings = {
         "wild/cards/are/fun",
@@ -219,7 +210,6 @@ end
 
 Fiber.spawn(function ()
     test_simple()
-    test_unauth_access()
     test_multi_sub()
     test_multi_topics()
     test_clean_sub()

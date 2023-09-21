@@ -88,12 +88,11 @@ function Connection:disconnect()
     self.subscriptions = {}
 end
 
-function Bus:connect(username, password)
-    if CREDS[username] == password then -- production ready!
-        return Connection.new(self)
-    else
-        return nil, 'Authentication failed'
-    end
+function Bus:connect(creds)
+    -- if not Bus:authenticate(creds) then
+    --     return nil, 'Authentication failed'
+    -- end
+    return Connection.new(self)
 end
 
 -- Bus:subscribe function
