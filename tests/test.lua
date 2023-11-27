@@ -1,6 +1,7 @@
 package.path = "../src/?.lua;" .. package.path
 
 local Fiber = require 'fibers.fiber'
+local Sleep = require 'fibers.sleep'
 local Bus = require 'bus'
 
 -- Test Simple PubSub
@@ -207,6 +208,38 @@ local function test_wildcard()
     print("Wildcard test passed!")
 end
 
+-- Test Request Reply
+local function test_request()
+    local bus = Bus.new({sep = "/"})
+
+    Fiber.spawn(function()
+        local connection = assert(bus:connect({user='user', password='pass'}))
+        local helper = assert(connection:subscribe("helpme"))
+        local rec = helper:next_msg()
+        connection:publish({topic=rec.reply_to, payload="Sure "..rec.payload})
+    end)
+
+    Fiber.spawn(function()
+        local connection = assert(bus:connect({user='user', password='pass'}))
+        local helper = assert(connection:subscribe("helpme"))
+        local rec = helper:next_msg()
+        Sleep.sleep(0.1)
+        connection:publish({topic=rec.reply_to, payload="No problem "..rec.payload})
+    end)
+
+    Sleep.sleep(0.1)
+
+    local connection3 = assert(bus:connect({user='user', password='pass'}))
+    local request = assert(connection3:request({topic="helpme", payload="John"}))
+
+    local msg, err = request:next_msg()
+    assert(msg.payload == "Sure John")
+    local msg, err = request:next_msg()
+    assert(msg.payload == "No problem John")
+
+    print("Request reply test passed!")
+end
+
 
 Fiber.spawn(function ()
     test_simple()
@@ -219,6 +252,7 @@ Fiber.spawn(function ()
     test_q_overflow()
     test_multi_creds()
     test_wildcard()
+    test_request()
     print("ALL TESTS PASSED!")
     Fiber.stop()
 end)

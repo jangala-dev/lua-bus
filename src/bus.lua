@@ -2,6 +2,7 @@ local queue = require 'fibers.queue'
 local op = require 'fibers.op'
 local sleep = require 'fibers.sleep'
 local trie = require 'trie'
+local uuid = require 'uuid'
 
 local DEFAULT_Q_LEN = 10
 
@@ -85,6 +86,13 @@ function Connection:disconnect()
         self:unsubscribe(subscription.topic, subscription)
     end
     self.subscriptions = {}
+end
+
+function Connection:request(msg)
+    msg.reply_to = uuid.new()
+    local sub = self:subscribe(msg.reply_to)
+    self:publish(msg)
+    return sub
 end
 
 function Bus:connect(creds)
