@@ -34,17 +34,16 @@ function Subscription.new(conn, topic, q)
     }, Subscription)
 end
 
+function Subscription:next_msg_op(timeout)
+    local msg_op = op.choice(
+        self.q:get_op(),
+        timeout and sleep.sleep_op(timeout):wrap(function () return nil, "Timeout" end) or nil
+    )
+    return msg_op
+end
+
 function Subscription:next_msg(timeout)
-    local msg
-    if timeout then
-        msg = op.choice(
-            self.q:get_op(),
-            sleep.sleep_op(timeout)
-        ):perform()
-    else
-        msg = self.q:get()
-    end
-    if msg then return msg else return nil, "Timeout" end
+    return self:next_msg_op(timeout):perform()
 end
 
 function Subscription:unsubscribe()
