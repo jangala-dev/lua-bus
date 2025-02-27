@@ -2,6 +2,7 @@ package.path = "../src/?.lua;" .. package.path
 
 local Bus = require 'bus'
 local Fiber = require 'fibers.fiber'
+
 local new_msg = Bus.new_msg
 
 -- Create an instance of Bus
