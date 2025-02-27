@@ -2,7 +2,7 @@ package.path = "../src/?.lua;" .. package.path
 
 local Fiber = require 'fibers.fiber'
 local Sleep = require 'fibers.sleep'
-local Bus = require 'newbus'
+local Bus = require 'bus'
 
 local new_msg = Bus.new_msg
 
