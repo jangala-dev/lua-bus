@@ -63,7 +63,9 @@ end
 Publish a message to a specific topic. Use `publish` to send a single message or `publish_multiple` to send nested payloads with hierarchical topics.
 
 ```lua
-local new_msg = require 'bus'.new_msg
+local Bus = require 'bus'
+
+local new_msg = Bus.new_msg
 
 -- Publish a single message
 connection:publish(new_msg({"foo", "bar", "fizz"}, "Hello World!", { retained = true }))
