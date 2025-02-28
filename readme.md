@@ -7,10 +7,10 @@ The Bus module provides a lightweight, concurrent messaging system built on our 
 ## Features
 
 - **Efficient Topic Matching:**  
-  Uses an enhanced Trie for storing topics and retained messages. This Trie supports flexible key types (strings, tables, or custom types) and robust wildcard matching with single-level (`+`) and multi-level (`#`) wildcards.
+  Uses an enhanced Trie for storing topics and retained messages. We use arrays of strings or numbers as keys, and robust wildcard matching with single-level (`+`) and multi-level (`#`) wildcards.
 
 - **Flexible Concurrency:**  
-  Built on a fibers framework that provides lightweight green threads, allowing asynchronous message retrieval with support for timeouts and cancellation using operations (`op.choice`, etc.).
+  Built on lua-fibers providing lightweight green threads, allowing asynchronous message retrieval with support for timeouts and cancellation using operations (`op.choice`, etc.).
 
 - **Asynchronous Message Delivery:**  
   Subscriptions offer both blocking and non-blocking message retrieval methods. Use methods like `next_msg_op`, `next_msg`, or context-aware variants to suit your concurrency model.
@@ -26,7 +26,7 @@ The Bus module provides a lightweight, concurrent messaging system built on our 
 
 ## Installation
 
-Ensure you have the required dependencies (fibers, fibers.queue, fibers.op, fibers.sleep, uuid, and our updated trie module). Then, include the Bus module in your Lua project.
+Ensure you have the required dependencies (lua-fibers and lua-trie). Then, include the Bus module in your Lua project.
 
 ```lua
 local Bus = require 'bus'
