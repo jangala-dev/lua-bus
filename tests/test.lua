@@ -4,17 +4,19 @@ local Fiber = require 'fibers.fiber'
 local Sleep = require 'fibers.sleep'
 local Bus = require 'bus'
 
+local new_msg = Bus.new_msg
+
 -- Test Simple PubSub
 local function test_simple()
-    local bus = Bus.new({sep = "/"})
+    local bus = Bus.new({m_wild = "#", s_wild = "+"})
 
-    local connection = assert(bus:connect({user='user', password='pass'}))
+    local conn = assert(bus:connect())
 
-    local subscription = assert(connection:subscribe("simple/topic"))
+    local sub = assert(conn:subscribe({"simple", "topic"}))
 
-    connection:publish({topic="simple/topic", payload="Hello"})
+    conn:publish(new_msg({"simple", "topic"}, "Hello"))
 
-    local msg, err = subscription:next_msg()
+    local msg, err = sub:next_msg()
     assert(msg.payload == "Hello" and not err)
 
     print("Simple test passed!")
@@ -22,102 +24,101 @@ end
 
 -- Test Multiple Subscribers
 local function test_multi_sub()
-    local bus = Bus.new({sep = "/"})
-    local connection1 = assert(bus:connect({user='user', password='pass'}))
-    local connection2 = assert(bus:connect({user='user', password='pass'}))
+    local bus = Bus.new({m_wild = "#", s_wild = "+"})
+    local conn_1 = assert(bus:connect())
+    local conn_2 = assert(bus:connect())
 
-    local subscription1 = assert(connection1:subscribe("multi/topic"))
-    local subscription2 = assert(connection2:subscribe("multi/topic"))
+    local sub_1 = assert(conn_1:subscribe({"multi", "topic"}))
+    local sub_2 = assert(conn_2:subscribe({"multi", "topic"}))
 
-    connection1:publish({topic="multi/topic", payload="Hello"})
+    conn_1:publish(new_msg({"multi", "topic"}, "Hello"))
 
-    assert(subscription1:next_msg().payload == "Hello")
-    assert(subscription2:next_msg().payload == "Hello")
+    assert(sub_1:next_msg().payload == "Hello")
+    assert(sub_2:next_msg().payload == "Hello")
 
     print("Multiple subscribers test passed!")
 end
 
 -- Test Multiple Topics
 local function test_multi_topics()
-    local bus = Bus.new({sep = "/"})
+    local bus = Bus.new({m_wild = "#", s_wild = "+"})
 
-    local connection = assert(bus:connect({user='user', password='pass'}))
+    local conn = assert(bus:connect())
 
-    local subscriptionA = assert(connection:subscribe("topic/A"))
-    local subscriptionB = assert(connection:subscribe("topic/B"))
+    local sub_A = assert(conn:subscribe({"topic", "A"}))
+    local sub_B = assert(conn:subscribe({"topic", "B"}))
 
-    connection:publish({topic="topic/A", payload="MessageA"})
+    conn:publish(new_msg({"topic", "A"}, "MessageA"))
 
-    assert(subscriptionA:next_msg().payload == "MessageA")
-    assert(subscriptionB:next_msg(1e-3) == nil) -- There shouldn't be any message for topic/B
+    assert(sub_A:next_msg().payload == "MessageA")
+    assert(sub_B:next_msg(1e-3) == nil) -- There shouldn't be any message for topic/B
 
     print("Multiple topics test passed!")
 end
 
 -- Test Clean Subscription
 local function test_clean_sub()
-    local bus = Bus.new({sep = "/"})
+    local bus = Bus.new({m_wild = "#", s_wild = "+"})
 
-    local connection = assert(bus:connect({user='user', password='pass'}))
+    local conn = assert(bus:connect())
 
-    connection:publish({topic="clean/topic", payload="OldMessage"})
-    local subscription = assert(connection:subscribe("clean/topic"))
+    conn:publish(new_msg({"clean", "topic"}, "OldMessage"))
+    local sub = assert(conn:subscribe({"clean", "topic"}))
 
     -- Since the old message was not retained, the new subscriber shouldn't receive it.
-    assert(subscription:next_msg(1e-3) == nil) 
+    assert(sub:next_msg(1e-3) == nil) 
 
     print("Clean subscription test passed!")
 end
 
 
--- Test Connection Cleanup
+-- Test conn Cleanup
 local function test_conn_clean()
-    local bus = Bus.new({sep = "/"})
+    local bus = Bus.new({m_wild = "#", s_wild = "+"})
 
-    local connection = assert(bus:connect({user='user', password='pass'}))
+    local conn = assert(bus:connect())
 
-    local subscription = assert(connection:subscribe("cleanup/topic"))
+    local sub = assert(conn:subscribe({"cleanup", "topic"}))
 
-    connection:publish({topic="cleanup/topic", payload="CleanupTest"})
-    assert(subscription:next_msg().payload == "CleanupTest")
+    conn:publish(new_msg({"cleanup", "topic"}, "CleanupTest"))
+    assert(sub:next_msg().payload == "CleanupTest")
 
-    -- Disconnect the connection and clean up subscriptions
-    connection:disconnect()
+    -- Disconnect the conn and clean up subscriptions
+    conn:disconnect()
 
-    -- Verify the subscription is cleaned up
-    local topic_data = bus.topics["cleanup/topic"]
-    assert(not topic_data or #topic_data.subscribers == 0, "Subscription was not cleaned up")
+    -- Verify the subscription is cleaned up using the Trie API
+    local topic_data = bus.topics:retrieve({"cleanup", "topic"})
+    assert(not topic_data or #topic_data.subs == 0, "Subscription was not cleaned up")
 
-    print("Connection cleanup test passed!")
+    print("conn cleanup test passed!")
 end
 
 
 -- Retained Message Test
 local function test_retained_msg()
-    local bus = Bus.new({sep = "/"})
+    local bus = Bus.new({m_wild = "#", s_wild = "+"})
 
-    local connection = assert(bus:connect({user='user', password='pass'}))
+    local conn = assert(bus:connect())
 
     -- Publish a retained message
-    connection:publish({topic="retained/topic", payload="RetainedMessage", retained=true})
+    conn:publish(new_msg({"retained", "topic"}, "RetainedMessage", {retained=true}))
 
     -- A new subscriber should receive the last retained message
-    local subscription = assert(connection:subscribe("retained/topic"))
-    assert(subscription:next_msg().payload == "RetainedMessage")
+    local sub = assert(conn:subscribe({"retained", "topic"}))
+    assert(sub:next_msg().payload == "RetainedMessage")
 
     print("Retained message test passed!")
 end
 
 -- Unsubscribe Test
 local function test_unsubscribe()
-    local bus = Bus.new({sep = "/"})
+    local bus = Bus.new({m_wild = "#", s_wild = "+"})
+    local conn = assert(bus:connect())
 
-    local connection = assert(bus:connect({user='user', password='pass'}))
-
-    local subscription = assert(connection:subscribe("unsubscribe/topic"))
+    local subscription = assert(conn:subscribe({"unsubscribe", "topic"}))
     subscription:unsubscribe()
 
-    connection:publish({topic="unsubscribe/topic", payload="NoReceive"})
+    conn:publish(new_msg({"unsubscribe", "topic"}, "NoReceive"))
     assert(subscription:next_msg(1e-3) == nil) -- The subscriber should not receive the message
 
     print("Unsubscribe test passed!")
@@ -125,77 +126,57 @@ end
 
 -- Queue Overflow Test
 local function test_q_overflow()
-    local bus = Bus.new({sep = "/"})
+    local bus = Bus.new({m_wild = "#", s_wild = "+"})
+    local conn = assert(bus:connect())
 
-    local connection = assert(bus:connect({user='user', password='pass'}))
-
-    local subscription = assert(connection:subscribe("overflow/topic"))
+    local sub = assert(conn:subscribe({"overflow", "topic"}))
 
     for i = 1, 11 do
-        connection:publish({topic="overflow/topic", payload="Message" .. i})
+        conn:publish(new_msg({"overflow", "topic"}, "Message"..i))
     end
 
     -- The 11th message should not be queued, so the last message should be "Message10"
     for i = 1, 10 do
-        assert(subscription:next_msg().payload == "Message" .. i)
+        assert(sub:next_msg().payload == "Message"..i)
     end
-    assert(subscription:next_msg(1e-3) == nil)
+    assert(sub:next_msg(1e-3) == nil)
 
     print("Queue overflow test passed!")
 end
 
--- Multiple Connections with Different Credentials
-local function test_multi_creds()
-    local bus = Bus.new({sep = "/"})
-
-    local connection1 = assert(bus:connect({user='user1', password='pass1'}))
-    local subscription1 = assert(connection1:subscribe("multi/creds/2"))
-    
-    local connection2 = assert(bus:connect({user='user2', password='pass2'}))
-    local subscription2 = assert(connection2:subscribe("multi/creds/1"))
-    
-    connection1:publish({topic="multi/creds/1", payload="FromUser1"})
-    connection2:publish({topic="multi/creds/2", payload="FromUser2"})
-
-    assert(subscription1:next_msg().payload == "FromUser2")
-    assert(subscription2:next_msg().payload == "FromUser1")
-
-    print("Multiple credentials test passed!")
-end
-
 -- Wildcard Test
 local function test_wildcard()
-    local bus = Bus.new({sep = "/", m_wild = "#", s_wild = "+"})
+    local bus = Bus.new({m_wild = "#", s_wild = "+"})
 
-    local connection = assert(bus:connect({user='user', password='pass'}))
+    local conn = assert(bus:connect())
 
     local working_sub_strings = {
-        "wild/cards/are/fun",
-        "wild/cards/are/+",
-        "wild/+/are/fun",
-        "wild/+/are/#",
-        "wild/+/#",
-        "#"
+        {"wild", "cards", "are", "fun"},
+        {"wild", "cards", "are", "+"},
+        {"wild", "+", "are", "fun"},
+        {"wild", "+", "are", "#"},
+        {"wild", "+", "#"},
+        {"#"}
     }
     local working_subs = {}
     for _, v in ipairs(working_sub_strings) do
-        local sub, _ = assert(connection:subscribe(v))
+        local sub, _ = assert(conn:subscribe(v))
         table.insert(working_subs, sub)
     end
 
     local not_working_sub_strings = {
-        "wild/cards/are/funny",
-        "wild/cards/are/+/fun",
-        "wild/+/+",
-        "tame/#",
+       { "wild", "cards", "are", "funny"},
+       { "wild", "cards", "are", "+", "fun"},
+       { "wild", "+", "+"},
+       { "tame", "#"},
     }
     local not_working_subs = {}
     for _, v in ipairs(not_working_sub_strings) do
-        local sub, _ = assert(connection:subscribe(v))
+        local sub, _ = assert(conn:subscribe(v))
         table.insert(not_working_subs, sub)
     end
     
-    connection:publish({topic="wild/cards/are/fun", payload="payload"})
+    conn:publish(new_msg({"wild", "cards", "are", "fun"}, "payload"))
 
     for i, v in ipairs(working_subs) do 
         assert(v:next_msg().payload=="payload")
@@ -213,24 +194,24 @@ local function test_request()
     local bus = Bus.new({sep = "/"})
 
     Fiber.spawn(function()
-        local connection = assert(bus:connect({user='user', password='pass'}))
-        local helper = assert(connection:subscribe("helpme"))
+        local conn = assert(bus:connect())
+        local helper = assert(conn:subscribe({"helpme"}))
         local rec = helper:next_msg()
-        connection:publish({topic=rec.reply_to, payload="Sure "..rec.payload})
+        conn:publish(new_msg({rec.reply_to}, "Sure "..rec.payload))
     end)
 
     Fiber.spawn(function()
-        local connection = assert(bus:connect({user='user', password='pass'}))
-        local helper = assert(connection:subscribe("helpme"))
+        local conn = assert(bus:connect())
+        local helper = assert(conn:subscribe({"helpme"}))
         local rec = helper:next_msg()
         Sleep.sleep(0.1)
-        connection:publish({topic=rec.reply_to, payload="No problem "..rec.payload})
+        conn:publish(new_msg({rec.reply_to}, "No problem "..rec.payload))
     end)
 
     Sleep.sleep(0.1)
 
-    local connection3 = assert(bus:connect({user='user', password='pass'}))
-    local request = assert(connection3:request({topic="helpme", payload="John"}))
+    local conn3 = assert(bus:connect())
+    local request = assert(conn3:request(new_msg({"helpme"}, "John")))
 
     local msg, err = request:next_msg()
     assert(msg.payload == "Sure John")
@@ -250,7 +231,6 @@ Fiber.spawn(function ()
     test_unsubscribe()
     test_retained_msg()
     test_q_overflow()
-    test_multi_creds()
     test_wildcard()
     test_request()
     print("ALL TESTS PASSED!")

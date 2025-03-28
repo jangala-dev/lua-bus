@@ -2,125 +2,151 @@
 
 ## Overview
 
-The `Bus` module provides a lightweight messaging and subscription system, using tries to provide efficient wildcard subscriptions and retained message delivery. It is built on lua-fibers.
-
-``` lua
--- Create a new Bus
-local bus = Bus.new({s_wild='+', m_wild='#', sep = '/'})
-
--- Fiber 1: Publisher
-Fiber.spawn(function()
-    -- Create a connection and publish to a topic
-    local conn = bus:connect({username='user', password ='pass'})
-    conn:publish({topic="foo/bar/fizz", payload="Hello World!", retained=true})
-end)
-
--- Fiber 2: Subscriber
-Fiber.spawn(function()
-    -- Create a connection and subscribe to a topic
-    local conn = bus:connect({username='user', password='pass'})
-    local sub = conn:subscribe("foo/#") -- using multi-level wildcard
-    
-    -- Listen for a message
-    local msg, _ = sub:next_msg(1e-3) -- 1 millisecond timeout
-    print("Fiber 2:", msg.payload)
-end)
-```
+The Bus module provides a lightweight, concurrent messaging system built on our updated Trie implementation and fibers framework. It offers efficient wildcard subscriptions, retained message delivery, and robust asynchronous message processing with advanced cancellation and timeout semantics. The design now cleanly separates message handling, subscription management, and connection logic while leveraging a flexible Trie-based topic matching engine.
 
 ## Features
 
-- **Efficient Storage and Retrieval**: The module uses our `trie` module for effective message and topic storage.
-  
-- **Wildcard Capabilities**: The system supports single and multiple wildcard subscriptions, allowing for flexible topic matching.
+- **Efficient Topic Matching:**  
+  Uses an enhanced Trie for storing topics and retained messages. We use arrays of strings or numbers as keys, and robust wildcard matching with single-level (`+`) and multi-level (`#`) wildcards.
 
-- **Asynchronous Message Retrieval**: Subscriptions provide synchronous and asynchronous message consumption with timeouts.
-  
-- **Retained Messages**: The ability to keep certain messages for future delivery to subscribers.
+- **Flexible Concurrency:**  
+  Built on lua-fibers providing lightweight green threads, allowing asynchronous message retrieval with support for timeouts and cancellation using operations (`op.choice`, etc.).
 
-- **Basic Authentication**: Basic username-password authentication before creating a connection.
+- **Asynchronous Message Delivery:**  
+  Subscriptions offer both blocking and non-blocking message retrieval methods. Use methods like `next_msg_op`, `next_msg`, or context-aware variants to suit your concurrency model.
+
+- **Retained Messages:**  
+  Retained messages are stored and delivered to new subscribers immediately upon subscription, ensuring that subscribers receive the latest state without needing to republish.
+
+- **Modular Connection Management:**  
+  The module cleanly separates the concepts of Message, Subscription, Connection, and Bus, providing a clear and maintainable API for both publishers and subscribers.
+
+- **Enhanced Error Handling:**  
+  Improved error and timeout management in subscription operations ensures that your fibers remain responsive and robust even under high load.
+
+## Installation
+
+Ensure you have the required dependencies (lua-fibers and lua-trie). Then, include the Bus module in your Lua project.
+
+```lua
+local Bus = require 'bus'
+```
 
 ## Usage
 
-### Initialisation
+### Initialization
 
-To create a new Bus:
+Create a new Bus instance by specifying configuration options such as queue length, wildcard tokens, and (if needed) a separator for string-based topics.
 
 ```lua
-local Bus = require 'your_module_path'
+local Bus = require 'bus'
 local bus = Bus.new({
-    q_length = 10,               -- Optional, default is 10
-    s_wild = '+',               -- Single wildcard character, replace with your choice
-    m_wild = '#',               -- Multi-level wildcard character, replace with your choice
-    sep = '/'                   -- Separator for the topics
+    q_length = 10,       -- Optional; defaults to 10 if not provided
+    s_wild = '+',        -- Single-level wildcard character
+    m_wild = '#',        -- Multi-level wildcard character
 })
 ```
 
-### Connection
+### Establishing a Connection
 
-Create a new connection to the Bus:
+Create a connection to the Bus. While the current version has removed built-in authentication for simplicity, you can integrate your own authentication layer before calling `connect`.
 
 ```lua
-local creds = {username = 'user', password = 'pass'}
-local connection = bus:connect(creds)
+local connection = bus:connect()
 if not connection then
-    print("Authentication failed!")
+    error("Connection failed!")
 end
 ```
 
-### Publishing and Subscribing
+### Publishing Messages
 
-Subscribe to a topic:
+Publish a message to a specific topic. Use `publish` to send a single message or `publish_multiple` to send nested payloads with hierarchical topics.
 
 ```lua
-local subscription = connection:subscribe("sample/topic")
+local Bus = require 'bus'
+
+local new_msg = Bus.new_msg
+
+-- Publish a single message
+connection:publish(new_msg({"foo", "bar", "fizz"}, "Hello World!", { retained = true }))
+
+-- Publish multiple messages from a nested payload
+connection:publish_multiple({"foo"}, {
+    bar = {
+        fizz = "Hello World!",
+        buzz = "Another Message"
+    }
+}, { retained = false })
 ```
 
-Retrieve the next message from a subscription:
+### Subscribing to Topics
+
+Subscribe to topics with support for wildcards. New subscriptions automatically receive any retained messages that match the topic pattern.
 
 ```lua
-local msg, err = subscription:next_msg(0.5) -- 0.5s timeout
-if not msg then
-    print("Timeout!")
+-- Subscribe using a multi-level wildcard
+local subscription = connection:subscribe({"foo", "#"})
+
+-- Retrieve the next message with a 1-millisecond timeout
+local msg, err = subscription:next_msg(1e-3)
+if msg then
+    print("Received:", msg.payload)
+elseif err then
+    print("Error:", err)
 end
 ```
 
-Publish a message:
+### Context-Aware Message Retrieval
+
+For advanced scenarios, you can use fibers context-aware message retrieval to handle cancellation or deadlines.
 
 ```lua
-connection:publish({
-    topic = "sample/topic",
-    payload = "Hello, World!",
-    retained = false
-})
+local parent = context.background()
+local ctx, cancel = context.with_cancel(parent)
+local msg, err = subscription:next_msg_with_context(context)
+if msg then
+    print("Received with context:", msg.payload)
+elseif err then
+    print("Context error:", err)
+end
 ```
 
-### Disconnecting and Cleanup
+### Cleanup and Disconnection
 
-To unsubscribe from a topic:
+Unsubscribe from topics and disconnect connections cleanly when finished.
 
 ```lua
+-- Unsubscribe from a topic
 subscription:unsubscribe()
-```
 
-To disconnect a connection:
-
-```lua
+-- Disconnect the connection (automatically unsubscribes from all topics)
 connection:disconnect()
 ```
 
 ## Technical Details
 
-- The module uses `fibers` for asynchronous operations.
+- **Trie-Based Topic Management:**  
+  The updated Trie implementation supports tokenization of keys as strings or tables, flexible wildcard matching, and iterative traversal to efficiently match topic subscriptions.
 
-- `Subscription:next_msg(timeout)` retrieves the next message from a subscription. If a timeout is provided, it will wait up to that duration for a message.
+- **Fibers Integration:**  
+  Asynchronous operations use fibers to allow non-blocking waits and cancellation through `op.choice` and other constructs. This enables smooth, concurrent message processing.
 
-- Messages that carry the `retained` flag without a payload will result in deletion of the retained message with the same topic.
+- **Retained Message Handling:**  
+  Messages marked as retained are stored in a separate Trie. When a new subscriber joins, all relevant retained messages are immediately enqueued.
 
-- The system has basic authentication, using a static credentials dictionary (`CREDS`). This should be expanded upon for a production environment.
+- **Connection & Subscription Lifecycles:**  
+  The Bus maintains connection-specific subscriptions for easier management. Disconnecting a connection automatically cleans up all associated subscriptions.
 
 ## Future Improvements
 
-- Proper logging of blocked queue operations.
-- Refinement of the authentication system.
-- Improving the efficiency of operations with large numbers of subscriptions.
-  - [ ] Federation (enabling multiple buses to interconnect)
+- **Logging Enhancements:**  
+  Implement detailed logging for queue blocking events and failed operations.
+
+- **Authentication:**  
+  Include authentication mechanisms for a secure, production-ready solution.
+
+- **Scalability Optimizations:**  
+  Investigate further optimizations for managing large numbers of subscriptions and topic matches.
+
+- **Federation Support:**  
+  Explore mechanisms to interconnect multiple buses for distributed message handling.
