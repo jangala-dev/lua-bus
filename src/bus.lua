@@ -10,7 +10,7 @@ local trie = require 'trie'
 local uuid = require 'uuid'
 
 --------------------------------------------------------------------------------
--- Message 
+-- Message
 --------------------------------------------------------------------------------
 
 --- Message class.
@@ -30,8 +30,8 @@ Message.__index = Message
 local function new_msg(topic, payload, opts)
     opts = opts or {}
     return setmetatable({
-        topic     = topic, 
-        payload   = payload, 
+        topic    = topic,
+        payload  = payload,
         retained  = opts.retained,
         reply_to  = opts.reply_to,
         headers   = opts.headers or {},
@@ -56,7 +56,7 @@ Subscription.__index = Subscription
 local function new_subscription(conn, topic, q)
     return setmetatable({
         connection = conn,
-        topic = topic, 
+        topic = topic,
         q = q
     }, Subscription)
 end
@@ -164,7 +164,7 @@ function Connection:publish_multiple(root_topic, nested_payload, opts)
             if type(value) == "table" then
                 table.insert(stack, {prefix = new_topic, payload = value})
             else
-                local msg = self:new_msg(new_topic, value, opts)
+                local msg = new_msg(new_topic, value, opts)
                 self:publish(msg)
             end
         end
@@ -215,7 +215,7 @@ end
 function Connection:request(msg)
     msg.reply_to = msg.reply_to or uuid.new()
     self:publish(msg)
-    return self:subscribe({msg.reply_to}) 
+    return self:subscribe({ msg.reply_to })
 end
 
 --------------------------------------------------------------------------------
