@@ -2,31 +2,60 @@
 
 ## Overview
 
-The Bus module provides a lightweight, concurrent messaging system built on our updated Trie implementation and fibers framework. It offers efficient wildcard subscriptions, retained message delivery, and robust asynchronous message processing with advanced cancellation and timeout semantics. The design now cleanly separates message handling, subscription management, and connection logic while leveraging a flexible Trie-based topic matching engine.
+The `bus` module provides an in-process pub/sub messaging bus built on `fibers` and a Trie-based topic matcher. It is intended for internal systems where components run as cooperative fibres under `fibers.run`, and where scope cancellation is treated as terminal.
+
+The design separates the core concepts:
+
+* **Message**: a topic-addressed payload with optional retained and request/reply metadata.
+* **Subscription**: a per-subscriber queue with a close/unsubscribe lifecycle and `Op`-based message retrieval.
+* **Connection**: an ownership boundary for subscriptions and the publishing API.
+* **Bus**: the shared pub/sub router, using two tries:
+
+  * a **pubsub trie** for wildcard subscriptions (wildcards in stored keys),
+  * a **retained trie** for retained state (literal stored keys; wildcards allowed in queries).
+
+The bus is designed for predictable behaviour under load: publishing is best-effort and does not block.
+
+## Assumptions and semantics
+
+* The module is used **only inside fibres**, i.e. from within `fibers.run(...)`.
+* **Cancellation is terminal**: `fibers.perform` may raise when the current scope is cancelled. Code should rely on `scope:finally(...)` for cleanup rather than catching cancellation.
+* Delivery is **best-effort**:
+
+  * each subscription has a bounded queue,
+  * if the queue is full, the message is dropped for that subscription.
+* Subscriptions support wildcard topics using:
+
+  * single-level wildcard: `+`
+  * multi-level wildcard: `#`
+    (both tokens are configurable at bus construction time).
 
 ## Features
 
-- **Efficient Topic Matching:**  
-  Uses an enhanced Trie for storing topics and retained messages. We use arrays of strings or numbers as keys, and robust wildcard matching with single-level (`+`) and multi-level (`#`) wildcards.
+* **Wildcard subscriptions**
+  Subscribe using token arrays (strings/numbers). Wildcards are matched by the pubsub trie.
 
-- **Flexible Concurrency:**  
-  Built on lua-fibers providing lightweight green threads, allowing asynchronous message retrieval with support for timeouts and cancellation using operations (`op.choice`, etc.).
+* **Retained messages**
+  Messages marked `retained=true` are stored and replayed to new subscriptions whose patterns match. A retained message with `payload=nil` deletes the retained value for that topic.
 
-- **Asynchronous Message Delivery:**  
-  Subscriptions offer both blocking and non-blocking message retrieval methods. Use methods like `next_msg_op`, `next_msg`, or context-aware variants to suit your concurrency model.
+* **Op-based message retrieval**
+  Subscriptions expose `next_msg_op(timeout)` which composes with the wider `fibers.op` system (`choice`, timeouts, etc.). A synchronous wrapper `next_msg(timeout)` is also provided.
 
-- **Retained Messages:**  
-  Retained messages are stored and delivered to new subscribers immediately upon subscription, ensuring that subscribers receive the latest state without needing to republish.
+* **Scope-bound lifecycle by default**
+  Connections are bound to the current scope; disconnect happens automatically on scope exit. Subscriptions are scope-bound by default (auto-unsubscribe on the current scope’s exit), with an opt-out.
 
-- **Modular Connection Management:**  
-  The module cleanly separates the concepts of Message, Subscription, Connection, and Bus, providing a clear and maintainable API for both publishers and subscribers.
-
-- **Enhanced Error Handling:**  
-  Improved error and timeout management in subscription operations ensures that your fibers remain responsive and robust even under high load.
+* **Request/reply helper**
+  A `reply_to` topic can be attached to a message. Helpers create a reply subscription (`request_sub`) or wait for the first reply (`request_once_op` / `request_once`).
 
 ## Installation
 
-Ensure you have the required dependencies (lua-fibers and lua-trie). Then, include the Bus module in your Lua project.
+This module depends on:
+
+* `fibers` (runtime, ops, sleep, channel, scope, cond)
+* `trie` (pubsub + retained trie implementation)
+* `uuid`
+
+Load the module in Lua:
 
 ```lua
 local Bus = require 'bus'
@@ -34,119 +63,186 @@ local Bus = require 'bus'
 
 ## Usage
 
-### Initialization
+### Initialisation
 
-Create a new Bus instance by specifying configuration options such as queue length, wildcard tokens, and (if needed) a separator for string-based topics.
+Create a new bus instance. You can configure queue length and wildcard tokens.
 
 ```lua
 local Bus = require 'bus'
+
 local bus = Bus.new({
-    q_length = 10,       -- Optional; defaults to 10 if not provided
-    s_wild = '+',        -- Single-level wildcard character
-    m_wild = '#',        -- Multi-level wildcard character
+  q_length = 10,   -- default per-subscription queue length
+  s_wild   = '+',  -- single-level wildcard token
+  m_wild   = '#',  -- multi-level wildcard token
 })
 ```
 
-### Establishing a Connection
+### Establish a connection
 
-Create a connection to the Bus. While the current version has removed built-in authentication for simplicity, you can integrate your own authentication layer before calling `connect`.
+`bus:connect()` returns a `Connection` that is automatically disconnected when the current scope exits.
 
 ```lua
-local connection = bus:connect()
-if not connection then
-    error("Connection failed!")
-end
+local conn = bus:connect()
 ```
 
-### Publishing Messages
+### Publishing
 
-Publish a message to a specific topic. Use `publish` to send a single message or `publish_multiple` to send nested payloads with hierarchical topics.
+Construct messages with `Bus.new_msg(topic, payload, opts)` and publish through a connection.
 
 ```lua
-local Bus = require 'bus'
-
 local new_msg = Bus.new_msg
 
--- Publish a single message
-connection:publish(new_msg({"foo", "bar", "fizz"}, "Hello World!", { retained = true }))
+-- Publish a retained state update
+conn:publish(new_msg({ 'fw', 'version' }, '1.2.3', { retained = true }))
 
--- Publish multiple messages from a nested payload
-connection:publish_multiple({"foo"}, {
-    bar = {
-        fizz = "Hello World!",
-        buzz = "Another Message"
-    }
-}, { retained = false })
+-- Publish a transient event
+conn:publish_topic({ 'net', 'link' }, { ifname = 'eth0', up = true })
 ```
 
-### Subscribing to Topics
-
-Subscribe to topics with support for wildcards. New subscriptions automatically receive any retained messages that match the topic pattern.
+Retained deletion uses `payload = nil`:
 
 ```lua
--- Subscribe using a multi-level wildcard
-local subscription = connection:subscribe({"foo", "#"})
+conn:publish(new_msg({ 'fw', 'version' }, nil, { retained = true }))
+```
 
--- Retrieve the next message with a 1-millisecond timeout
-local msg, err = subscription:next_msg(1e-3)
+### Subscribing
+
+Subscribe to a topic pattern. By default:
+
+* retained messages are replayed immediately,
+* the subscription is scope-bound (auto-unsubscribe when the current scope exits).
+
+```lua
+local sub = conn:subscribe({ 'fw', '#' })
+```
+
+You can control behaviour:
+
+```lua
+local sub = conn:subscribe({ 'net', '+' }, {
+  replay_retained = true,   -- default: true
+  queue_len       = 50,     -- override default queue length
+  scope_bound     = true,   -- default: true
+})
+```
+
+### Receiving messages
+
+Use `next_msg(timeout)` for a blocking call, or `next_msg_op(timeout)` to compose with other ops.
+
+```lua
+local msg, err = sub:next_msg(1.0) -- seconds
 if msg then
-    print("Received:", msg.payload)
+  print('topic:', table.concat(msg.topic, '/'), 'payload:', msg.payload)
 elseif err then
-    print("Error:", err)
+  print('no message:', err) -- 'timeout', 'unsubscribed', 'disconnected', etc.
 end
 ```
 
-### Context-Aware Message Retrieval
-
-For advanced scenarios, you can use fibers context-aware message retrieval to handle cancellation or deadlines.
+`next_msg_op` returns an `Op` that yields `(Message|nil, err|string|nil)`:
 
 ```lua
-local parent = context.background()
-local ctx, cancel = context.with_cancel(parent)
-local msg, err = subscription:next_msg_with_context(context)
-if msg then
-    print("Received with context:", msg.payload)
-elseif err then
-    print("Context error:", err)
+local fibers = require 'fibers'
+
+local msg, err = fibers.perform(sub:next_msg_op(0.1))
+```
+
+### Unsubscribe and disconnect
+
+Unsubscribing is idempotent and wakes any waiters.
+
+```lua
+sub:unsubscribe()
+```
+
+Disconnecting a connection unsubscribes and closes all of its subscriptions (idempotent):
+
+```lua
+conn:disconnect()
+```
+
+## Request/reply
+
+### Multi-reply: subscribe to replies and publish request
+
+`request_sub` ensures a `reply_to` topic exists, subscribes to it first (to avoid racing responders), then publishes.
+
+```lua
+local req = Bus.new_msg({ 'rpc', 'get_status' }, { verbose = true })
+
+local replies = conn:request_sub(req, {
+  queue_len = 10,
+  scope_bound = true,
+})
+
+-- consume replies until you decide to stop
+local msg, err = replies:next_msg(1.0)
+```
+
+### Single reply: wait for the first reply
+
+`request_once_op` is suitable for use with `choice` and timeouts; it uses `op.bracket` to guarantee cleanup of the temporary subscription.
+
+```lua
+local req = Bus.new_msg({ 'rpc', 'ping' }, { answer = 42 })
+
+local reply, err = conn:request_once(req, { timeout = 1.0 })
+if reply then
+  print('reply:', reply.payload)
+else
+  print('request failed:', err)
 end
 ```
 
-### Cleanup and Disconnection
+## Message structure
 
-Unsubscribe from topics and disconnect connections cleanly when finished.
+A `Message` has:
+
+* `topic` (table): token array (strings/numbers)
+* `payload` (any): user payload
+* `retained` (boolean|nil): retained policy
+* `reply_to` (table|nil): token array for replies
+* `headers` (table): arbitrary metadata (default `{}`)
+* `id` (any): caller-supplied or generated UUID
+
+Construct via:
 
 ```lua
--- Unsubscribe from a topic
-subscription:unsubscribe()
-
--- Disconnect the connection (automatically unsubscribes from all topics)
-connection:disconnect()
+local msg = Bus.new_msg({ 'a', 'b' }, 'hello', { retained = true, headers = { x = 1 } })
 ```
 
-## Technical Details
+## Delivery and backpressure policy
 
-- **Trie-Based Topic Management:**  
-  The updated Trie implementation supports tokenization of keys as strings or tables, flexible wildcard matching, and iterative traversal to efficiently match topic subscriptions.
+Publishing uses a best-effort enqueue:
 
-- **Fibers Integration:**  
-  Asynchronous operations use fibers to allow non-blocking waits and cancellation through `op.choice` and other constructs. This enables smooth, concurrent message processing.
+* the bus attempts a single non-blocking `put_op` into each subscriber queue,
+* if the queue is full, the message is dropped for that subscriber,
+* publishing does not block the publisher fibre.
 
-- **Retained Message Handling:**  
-  Messages marked as retained are stored in a separate Trie. When a new subscriber joins, all relevant retained messages are immediately enqueued.
+This is a deliberate choice for firmware control workloads where:
 
-- **Connection & Subscription Lifecycles:**  
-  The Bus maintains connection-specific subscriptions for easier management. Disconnecting a connection automatically cleans up all associated subscriptions.
+* retained topics cover “latest state”,
+* event topics can tolerate drops under overload,
+* and a slow consumer should not stall the system.
 
-## Future Improvements
+If your use case requires lossless delivery, build it explicitly on top (eg acknowledgements, per-topic flow control, or a “durable state” topic that is always retained).
 
-- **Logging Enhancements:**  
-  Implement detailed logging for queue blocking events and failed operations.
+## Notes for service integration
 
-- **Authentication:**  
-  Include authentication mechanisms for a secure, production-ready solution.
+* Prefer to create one `Connection` per service scope via `bus:connect()`.
+* Prefer scope-bound subscriptions (the default).
+* Use `scope:finally(...)` for any service cleanup that must run even during cancellation.
+* Treat cancellation as terminal: do not attempt to “complete protocols” after cancellation; instead ensure resources are released and subprocesses are shut down via finalisers.
 
-- **Scalability Optimizations:**  
-  Investigate further optimizations for managing large numbers of subscriptions and topic matches.
+## Known limitations / considerations
 
-- **Federation Support:**  
-  Explore mechanisms to interconnect multiple buses for distributed message handling.
+* Message delivery is best-effort; drops are silent by default.
+* Retained messages are replayed as stored `Message` objects; treat messages as immutable in consumers.
+* The module assumes all interactions occur within fibres; behaviour outside `fibers.run` is not defined.
+
+## Possible future improvements (if needed)
+
+* Optional instrumentation hooks (drops per subscription/topic, queue depth sampling).
+* Alternative delivery modes (eg notify-on-drop, coalescing per topic, lossless per subscriber with backpressure).
+* Convenience helpers for merging multiple subscriptions via `op.choice` or named selection.
+* Optional “service RPC” conventions on top of `reply_to` (correlation headers, standard error replies).
