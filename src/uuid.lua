@@ -19,7 +19,9 @@
 -- to guarantee spacial uniqueness when two hosts generate a uuid after being seeded during the same second.  This
 -- is solved by using the node field from a version 1 UUID.  It represents the mac address.
 --
--- 28-apr-2013 modified by Thijs Schreijer from the original [Rackspace code](https://github.com/kans/zirgo/blob/807250b1af6725bad4776c931c89a784c1e34db2/util/uuid.lua) as a generic Lua module.
+-- 28-apr-2013 modified by Thijs Schreijer from the original
+-- [Rackspace code](https://github.com/kans/zirgo/blob/807250b1af6725bad4776c931c89a784c1e34db2/util/uuid.lua)
+-- as a generic Lua module.
 -- Regarding the above mention on `os.time()`; the modifications use the `socket.gettime()` function from LuaSocket
 -- if available and hence reduce that problem (provided LuaSocket has been loaded before uuid).
 --
@@ -92,7 +94,9 @@ end
 -- eg. `my_uuid = uuid(my_networkcard_macaddress)`
 --
 -- @return a properly formatted uuid string
--- @param hwaddr (optional) string containing a unique hex value (e.g.: `00:0c:29:69:41:c6`), to be used to compensate for the lesser `math_random()` function. Use a mac address for solid results. If omitted, a fully randomized uuid will be generated, but then you must ensure that the random seed is set properly!
+-- @param hwaddr (optional) string containing a unique hex value (e.g.: `00:0c:29:69:41:c6`), to be used to compensate
+-- for the lesser `math_random()` function. Use a mac address for solid results. If omitted, a fully randomized uuid
+--  will be generated, but then you must ensure that the random seed is set properly!
 -- @usage
 -- local uuid = require("uuid")
 -- print("here's a new uuid: ",uuid())
@@ -130,7 +134,10 @@ function M.new(hwaddr)
       end
       i = i - 1
     end
-    assert(#hwaddr == 12, "Provided string did not contain at least 12 hex characters, retrieved '"..hwaddr.."' from '"..str.."'")
+    assert(
+      #hwaddr == 12,
+      "Provided string did not contain at least 12 hex characters, retrieved '"..hwaddr.."' from '"..str.."'"
+    )
 
     -- no split() in lua. :(
     bytes[11] = to_number(hwaddr:sub(1, 2), 16)
@@ -151,7 +158,9 @@ function M.new(hwaddr)
          INT2HEX(bytes[5])..INT2HEX(bytes[6]).."-"..
          INT2HEX(bytes[7])..INT2HEX(bytes[8]).."-"..
          INT2HEX(bytes[9])..INT2HEX(bytes[10]).."-"..
-         INT2HEX(bytes[11])..INT2HEX(bytes[12])..INT2HEX(bytes[13])..INT2HEX(bytes[14])..INT2HEX(bytes[15])..INT2HEX(bytes[16])
+         INT2HEX(bytes[11])..INT2HEX(bytes[12])..
+         INT2HEX(bytes[13])..INT2HEX(bytes[14])..
+         INT2HEX(bytes[15])..INT2HEX(bytes[16])
 end
 
 ----------------------------------------------------------------------------
@@ -204,9 +213,7 @@ end
 -- uuid.seed()
 -- print("here's a new uuid: ",uuid())
 function M.seed()
-  if _G.ngx ~= nil then
-    return M.randomseed(ngx.time() + ngx.worker.pid())
-  elseif package.loaded["socket"] and package.loaded["socket"].gettime then
+  if package.loaded["socket"] and package.loaded["socket"].gettime then
     return M.randomseed(package.loaded["socket"].gettime()*10000)
   else
     return M.randomseed(os.time())
