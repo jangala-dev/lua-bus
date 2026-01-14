@@ -3,63 +3,76 @@
 ---  - retained messages (retained trie: literal stored keys; wildcards in queries)
 ---  - request/response helper (reply_to topic)
 ---
---- Assumptions:
----  - This module is used only from within fibers (inside fibers.run).
----  - Cancellation is terminal; fibers.perform may raise on scope cancellation.
+--- Intended use:
+---   local bus  = require('bus').new(...)
+---   local conn = bus:connect()
+---   local sub  = conn:subscribe({ "a", "b" })
+---   conn:publish({ "a", "b" }, "payload")
+---   local msg, err = sub:next_msg()
+---
+--- Notes:
+---  - Intended to be used from inside fibres (inside fibers.run).
+---  - Delivery is bounded and non-blocking: publish never blocks.
+---  - Timeouts are composed externally using choice + sleep.
 ---@module 'bus'
 
-local channel    = require 'fibers.channel'
-local op         = require 'fibers.op'
-local sleep      = require 'fibers.sleep'
-local performer  = require 'fibers.performer'
-local scope_mod  = require 'fibers.scope'
-local cond       = require 'fibers.cond'
+local mailbox   = require 'fibers.mailbox'
+local op        = require 'fibers.op'
+local performer = require 'fibers.performer'
+local scope_mod = require 'fibers.scope'
 
-local trie       = require 'trie'
-local uuid       = require 'uuid'
+local trie = require 'trie'
+local uuid = require 'uuid'
 
 local perform = performer.perform
 
+---@alias Topic any[]
+---@alias FullPolicy '"drop_oldest"'|'"drop_newest"'
+
+local DEFAULT_Q_LEN  = 10
+local DEFAULT_POLICY = 'drop_oldest'
+
+---@param p any
+---@param level? integer
+---@return FullPolicy|nil
+local function assert_full_policy(p, level)
+	level = (level or 1) + 1
+	if p == nil then return nil end
+	if p == 'drop_oldest' or p == 'drop_newest' then return p end
+	if p == 'block' then
+		error('bus delivery must be bounded; mailbox full policy "block" is not supported', level)
+	end
+	error('invalid mailbox full policy: ' .. tostring(p), level)
+end
+
+---@param tx any
+---@return number
+local function mailbox_dropped(tx)
+	return (tx and tx.dropped and tx:dropped()) or 0
+end
+
 --------------------------------------------------------------------------------
--- Message
+-- Message (data shape; exposed via Subscription)
 --------------------------------------------------------------------------------
 
 ---@class Message
----@field topic table
----@field payload any
----@field retained boolean|nil
----@field reply_to table|nil
----@field headers table
----@field id any
+---@field topic Topic        # message topic token array
+---@field payload any        # message payload (user-defined)
+---@field reply_to Topic|nil # reply topic (request/response helper)
+---@field id any|nil         # optional message id (unused by default)
 local Message = {}
 Message.__index = Message
 
----@param topic table
+---@param topic Topic
 ---@param payload any
----@param opts? { retained?:boolean, reply_to?:table|string|number, headers?:table, id?:any }
+---@param reply_to? Topic
 ---@return Message
-local function new_msg(topic, payload, opts)
-	opts = opts or {}
-
-	local reply_to = opts.reply_to
-	if reply_to ~= nil then
-		local tr = type(reply_to)
-		if tr == 'table' then
-			-- ok
-		elseif tr == 'string' or tr == 'number' then
-			reply_to = { reply_to }
-		else
-			error('reply_to must be a token array, string, or number', 2)
-		end
-	end
-
+local function new_msg(topic, payload, reply_to)
 	return setmetatable({
-		topic     = topic,
-		payload   = payload,
-		retained  = opts.retained,
-		reply_to  = reply_to,
-		headers   = opts.headers or {},
-		id        = (opts.id ~= nil) and opts.id or uuid.new(),
+		topic    = topic,
+		payload  = payload,
+		reply_to = reply_to,
+		id       = nil,
 	}, Message)
 end
 
@@ -69,91 +82,188 @@ end
 
 ---@class Subscription
 ---@field _conn Connection|nil
----@field _topic table
----@field _ch Channel
----@field _closed boolean
----@field _close_reason string|nil
----@field _close_cond Cond
----@field _detach_finaliser fun()|nil
+---@field _topic Topic
+---@field _tx MailboxTx
+---@field _rx MailboxRx
+---@field _detach_finaliser (fun())|nil
 local Subscription = {}
 Subscription.__index = Subscription
 
-local function new_subscription(conn, topic, ch)
+---@param conn Connection
+---@param topic Topic
+---@param tx MailboxTx
+---@param rx MailboxRx
+---@return Subscription
+local function new_subscription(conn, topic, tx, rx)
 	return setmetatable({
 		_conn             = conn,
 		_topic            = topic,
-		_ch               = ch,
-		_closed           = false,
-		_close_reason     = nil,
-		_close_cond       = cond.new(),
+		_tx               = tx,
+		_rx               = rx,
 		_detach_finaliser = nil,
 	}, Subscription)
 end
 
----@return table
+--- Return the number of messages dropped for this subscription (best-effort).
+---@return number
+function Subscription:dropped()
+	return mailbox_dropped(self._tx)
+end
+
+--- Return the topic pattern this subscription was created with.
+---@return Topic
 function Subscription:topic()
 	return self._topic
 end
 
----@return boolean, string|nil
-function Subscription:is_closed()
-	return self._closed, self._close_reason
-end
-
+---@param reason any
 function Subscription:_close(reason)
-	if self._closed then return end
-	self._closed = true
-	self._close_reason = reason or self._close_reason or 'closed'
-	self._close_cond:signal()
+	if self._tx then self._tx:close(reason) end
 end
 
 --- Unsubscribe this subscription (idempotent).
+---@return boolean ok
 function Subscription:unsubscribe()
 	local conn = self._conn
 	if not conn then
-		-- Ensure receivers wake even if already detached.
 		self:_close('unsubscribed')
 		return true
 	end
 	return conn:unsubscribe(self)
 end
 
---- Op yielding the next message, or (nil, err) on timeout/closed.
----@param timeout? number
----@return Op
-function Subscription:next_msg_op(timeout)
-  return op.guard(function ()
-    -- Fast path: already closed dominates everything.
-    if self._closed then return op.always(nil, self._close_reason or 'closed') end
-
-    local closed_ev = self._close_cond:wait_op():wrap(function ()
-      return nil, self._close_reason or 'closed'
-    end)
-
-    local msg_ev = self._ch:get_op():wrap(function (msg)
-      -- Close dominates: if we were closed at any point before commit, drop.
-      if self._closed then return nil, self._close_reason or 'closed' end
-      return msg, nil
-    end)
-
-    if timeout ~= nil then
-      local to_ev = sleep.sleep_op(timeout):wrap(function ()
-        -- Also let close dominate over a concurrent timeout.
-        if self._closed then return nil, self._close_reason or 'closed' end
-        return nil, 'timeout'
-      end)
-
-      return op.choice(msg_ev, closed_ev, to_ev)
-    end
-
-    return op.choice(msg_ev, closed_ev)
-  end)
+--- Op yielding the next message, or (nil, err) once closed and drained.
+---@return Op  -- when performed: Message|nil, string|nil
+function Subscription:next_msg_op()
+	return self._rx:recv_op():wrap(function (msg)
+		if msg == nil then
+			return nil, tostring(self._rx:why() or 'closed')
+		end
+		return msg, nil
+	end)
 end
 
----@param timeout? number
----@return Message|nil msg, string|nil err
-function Subscription:next_msg(timeout)
-	return perform(self:next_msg_op(timeout))
+--- Receive the next message, or (nil, err) once closed and drained.
+---@return Message|nil msg
+---@return string|nil err
+function Subscription:next_msg()
+	return perform(self:next_msg_op())
+end
+
+--- Iterator over messages until the subscription closes.
+---@return fun(): Message|nil
+function Subscription:messages()
+	return self._rx:iter()
+end
+
+--- Iterator over payloads until the subscription closes.
+---@return fun(): any|nil
+function Subscription:payloads()
+	local it = self._rx:iter()
+	return function ()
+		local msg = it()
+		return msg and msg.payload or nil
+	end
+end
+
+--- Return the close reason, once the subscription has closed.
+---@return any|nil
+function Subscription:why()
+	return self._rx:why()
+end
+
+--- Return a small stats snapshot for this subscription.
+---@return table
+function Subscription:stats()
+	return { dropped = self:dropped(), topic = self._topic }
+end
+
+--------------------------------------------------------------------------------
+-- Bus
+--------------------------------------------------------------------------------
+
+---@class BusBucket
+---@field subs table<Subscription, boolean>
+
+---@class Bus
+---@field _q_length integer
+---@field _full FullPolicy
+---@field _topics any
+---@field _retained any
+---@field _conns table<Connection, boolean>
+local Bus = {}
+Bus.__index = Bus
+
+---@param sub Subscription
+local function detach_finaliser(sub)
+	if sub._detach_finaliser then
+		sub._detach_finaliser()
+		sub._detach_finaliser = nil
+	end
+end
+
+--- Deliver a message to a subscription without blocking; drops if it would block.
+---@param sub Subscription
+---@param msg Message
+function Bus:_deliver(sub, msg)
+	perform(sub._tx:send_op(msg):or_else(function () return nil end))
+end
+
+---@param conn Connection
+---@param topic Topic
+---@param qlen integer
+---@param full FullPolicy
+---@return Subscription
+function Bus:_subscribe(conn, topic, qlen, full)
+	---@type BusBucket|nil
+	local bucket = self._topics:retrieve(topic)
+	if not bucket then
+		bucket = { subs = {} }
+		self._topics:insert(topic, bucket)
+	end
+
+	local tx, rx = mailbox.new(qlen, { full = full })
+	local sub    = new_subscription(conn, topic, tx, rx)
+	bucket.subs[sub] = true
+
+	-- Best-effort retained replay (bounded + non-blocking).
+	self._retained:each(topic, function (retained_msg)
+		self:_deliver(sub, retained_msg)
+	end)
+
+	return sub
+end
+
+---@param sub Subscription
+function Bus:_unsubscribe(sub)
+	local bucket = self._topics:retrieve(sub._topic)
+	if not bucket then return end
+	bucket.subs[sub] = nil
+	if next(bucket.subs) == nil then
+		self._topics:delete(sub._topic)
+	end
+end
+
+---@param msg Message
+function Bus:_publish(msg)
+	self._topics:each(msg.topic, function (bucket)
+		for sub in pairs(bucket.subs) do
+			if sub and sub._tx then
+				self:_deliver(sub, msg)
+			end
+		end
+	end)
+end
+
+---@param msg Message
+function Bus:_retain(msg)
+	self:_publish(msg)
+	self._retained:insert(msg.topic, msg)
+end
+
+---@param topic Topic
+function Bus:_unretain(topic)
+	self._retained:delete(topic)
 end
 
 --------------------------------------------------------------------------------
@@ -161,359 +271,255 @@ end
 --------------------------------------------------------------------------------
 
 ---@class Connection
----@field _bus Bus|nil
+---@field _bus Bus
+---@field _q_length integer
+---@field _full FullPolicy
 ---@field _subs table<Subscription, boolean>
 ---@field _disconnected boolean
 local Connection = {}
 Connection.__index = Connection
 
-local function new_connection(bus)
+---@param bus Bus
+---@param q_length integer
+---@param full FullPolicy
+---@return Connection
+local function new_connection(bus, q_length, full)
 	return setmetatable({
 		_bus          = bus,
+		_q_length     = q_length,
+		_full         = full,
 		_subs         = {},
 		_disconnected = false,
 	}, Connection)
 end
 
+--- Return whether this connection has been disconnected.
 ---@return boolean
 function Connection:is_disconnected()
 	return self._disconnected
 end
 
----@param msg Message
-function Connection:publish(msg)
-	assert(getmetatable(msg) == Message, 'publish expects a Message')
-	assert(self._bus, 'connection is closed')
-	return self._bus:publish(msg)
+--- Return total drops across all subscriptions owned by this connection.
+---@return number
+function Connection:dropped()
+	local n = 0
+	for sub in pairs(self._subs) do
+		n = n + sub:dropped()
+	end
+	return n
 end
 
----@param topic table
+--- Publish a message to the bus (best-effort fanout; never blocks).
+---@param topic Topic
 ---@param payload any
----@param opts? table
-function Connection:publish_topic(topic, payload, opts)
-	return self:publish(new_msg(topic, payload, opts))
+---@return boolean ok
+function Connection:publish(topic, payload)
+	assert(not self._disconnected, 'connection is disconnected')
+	self._bus:_publish(new_msg(topic, payload))
+	return true
+end
+
+--- Publish and retain a message under its exact topic.
+---@param topic Topic
+---@param payload any
+---@return boolean ok
+function Connection:retain(topic, payload)
+	assert(not self._disconnected, 'connection is disconnected')
+	self._bus:_retain(new_msg(topic, payload))
+	return true
+end
+
+--- Remove any retained message stored under the exact topic.
+---@param topic Topic
+---@return boolean ok
+function Connection:unretain(topic)
+	assert(type(topic) == 'table', 'unretain expects a topic token array (table)')
+	assert(not self._disconnected, 'connection is disconnected')
+	self._bus:_unretain(topic)
+	return true
 end
 
 --- Subscribe to a topic pattern.
---- opts.scope_bound (default true):
----   - true  : unsubscribe automatically when the *current scope* exits
----   - false : caller is responsible for unsubscribing (bracket is typical)
----@param topic table
----@param opts? { replay_retained?: boolean, queue_len?: integer, scope_bound?: boolean }
+---
+--- queue_len:
+---   * 0 creates a rendezvous-style subscription (no buffering).
+---   * >0 buffers up to queue_len messages.
+---
+--- full_policy:
+---   * 'drop_newest' or 'drop_oldest' (bounded, non-blocking)
+---   * 'block' is rejected by this bus.
+---@param topic Topic
+---@param queue_len? integer
+---@param full_policy? FullPolicy
 ---@return Subscription
-function Connection:subscribe(topic, opts)
-	if self._disconnected then
-		error('connection is disconnected', 2)
-	end
-	local bus = assert(self._bus, 'connection is closed')
+function Connection:subscribe(topic, queue_len, full_policy)
+	if self._disconnected then error('connection is disconnected') end
 
-	opts = opts or {}
-	local qlen = opts.queue_len or bus._q_length
+	local qlen = queue_len
+	if qlen == nil then qlen = self._q_length end
+	assert(type(qlen) == 'number' and qlen >= 0, 'subscribe: queue_len must be >= 0')
 
-	local sub = bus:_subscribe(self, topic, qlen, opts.replay_retained ~= false)
+	local full = assert_full_policy(full_policy or self._full, 2) or DEFAULT_POLICY
+
+	local sub = self._bus:_subscribe(self, topic, qlen, full)
 	self._subs[sub] = true
 
-	-- Optional scope-bound cleanup using the *current* scope.
-	if opts.scope_bound ~= false then
-		local s = scope_mod.current()
-		sub._detach_finaliser = s:finally(function ()
-			sub:unsubscribe()
-		end)
-	end
+	-- Scope-bound cleanup using the current scope.
+	local s = scope_mod.current()
+	sub._detach_finaliser = s:finally(function () sub:unsubscribe() end)
 
 	return sub
 end
 
+---@param sub Subscription
+---@param reason any
+---@param remove_from_bus boolean
+function Connection:_drop_sub(sub, reason, remove_from_bus)
+	sub:_close(reason)
+	detach_finaliser(sub)
+	if remove_from_bus then self._bus:_unsubscribe(sub) end
+	if sub._conn == self then sub._conn = nil end
+end
+
 --- Unsubscribe a subscription owned by this connection (idempotent).
 ---@param sub Subscription
+---@return boolean ok
 function Connection:unsubscribe(sub)
 	if not sub or getmetatable(sub) ~= Subscription then
-		error('unsubscribe expects a Subscription', 2)
+		error('unsubscribe expects a Subscription')
 	end
 
-	-- Always mark closed (wakes any receivers), even for foreign/already-removed subs.
-	sub:_close('unsubscribed')
-
-	-- Idempotent: ignore unknown subs (already removed / foreign).
-	if not self._subs[sub] then
-		-- Break any remaining ownership link if it still points at us.
-		if sub._conn == self then sub._conn = nil end
-		return true
-	end
-
-	self._subs[sub] = nil
-
-	-- Detach any scope finaliser now that the subscription is explicitly ended.
-	if sub._detach_finaliser then
-		sub._detach_finaliser()
-		sub._detach_finaliser = nil
-	end
-
-	local bus = self._bus
-	if bus then
-		bus:_unsubscribe(sub) -- pure removal; does not close
-	end
-
-	-- Break reference cycles / ownership.
-	sub._conn = nil
-
+	local owned = not not self._subs[sub]
+	self:_drop_sub(sub, 'unsubscribed', owned)
+	if owned then self._subs[sub] = nil end
 	return true
 end
 
---- Disconnect the connection (idempotent).
+--- Disconnect this connection and close all owned subscriptions (idempotent).
+---@return boolean ok
 function Connection:disconnect()
 	if self._disconnected then return true end
 	self._disconnected = true
 
-	local bus = self._bus
-	self._bus = nil
-
-	-- Snapshot subscriptions to avoid mutation hazards.
-	local snap = {}
 	for sub in pairs(self._subs) do
-		snap[#snap + 1] = sub
-	end
-	self._subs = {}
-
-	for i = 1, #snap do
-		local sub = snap[i]
-
-		if sub._detach_finaliser then
-			sub._detach_finaliser()
-			sub._detach_finaliser = nil
-		end
-
-		sub:_close('disconnected')
-
-		if bus then
-			bus:_unsubscribe(sub)
-		end
-
-		sub._conn = nil
-		snap[i] = nil
+		self:_drop_sub(sub, 'disconnected', true)
+		self._subs[sub] = nil
 	end
 
+	local bus = self._bus
+	if bus and bus._conns then bus._conns[self] = nil end
 	return true
+end
+
+--- Return a small stats snapshot for this connection.
+---@return table
+function Connection:stats()
+	local nsubs = 0
+	for _ in pairs(self._subs) do nsubs = nsubs + 1 end
+	return { dropped = self:dropped(), subscriptions = nsubs }
 end
 
 --------------------------------------------------------------------------------
 -- Request helpers
 --------------------------------------------------------------------------------
 
-local function ensure_reply_to(msg, opts)
-	if msg.reply_to then
-		return msg.reply_to
-	end
-
-	local id = uuid.new()
-	local prefix = opts and opts.reply_topic_prefix or nil
-
-	if prefix then
-		local t = {}
-		for i = 1, #prefix do t[i] = prefix[i] end
-		t[#t + 1] = id
-		msg.reply_to = t
-	else
-		msg.reply_to = { id }
-	end
-
-	return msg.reply_to
-end
-
---- Request/response: subscribe to replies and publish request.
---- Returns a Subscription on the reply topic (multi-reply).
----@param msg Message
----@param opts? { reply_topic_prefix?: table, queue_len?: integer, scope_bound?: boolean }
+--- Publish a request with a reply_to topic; returns a subscription for replies.
+---@param topic Topic
+---@param payload any
+---@param queue_len? integer
+---@param full_policy? FullPolicy
 ---@return Subscription
-function Connection:request_sub(msg, opts)
-	assert(getmetatable(msg) == Message, 'request_sub expects a Message')
-	opts = opts or {}
-
-	local reply_to = ensure_reply_to(msg, opts)
+function Connection:request_sub(topic, payload, queue_len, full_policy)
+	local reply_to = { uuid.new() }
+	local msg      = new_msg(topic, payload, reply_to)
 
 	-- Subscribe first to avoid racing a fast responder.
-	local sub = self:subscribe(reply_to, {
-		replay_retained = false,
-		queue_len       = opts.queue_len,
-		scope_bound     = (opts.scope_bound ~= false),
-	})
-
-	self:publish(msg)
+	local sub = self:subscribe(reply_to, queue_len, full_policy)
+	self._bus:_publish(msg)
 	return sub
 end
 
---- Request/response: return exactly one reply (first reply wins).
----@param msg Message
----@param opts? { timeout?: number, reply_topic_prefix?: table, queue_len?: integer }
----@return Op  -- when performed: Message|nil reply, string|nil err
-function Connection:request_once_op(msg, opts)
-	assert(getmetatable(msg) == Message, 'request_once_op expects a Message')
-	opts = opts or {}
-
-	local timeout = opts.timeout
-
+--- Request/response helper returning exactly one reply (first reply wins).
+--- Compose timeouts externally using choice + sleep.
+---@param topic Topic
+---@param payload any
+---@return Op  -- when performed: Message|nil, string|nil
+function Connection:request_once_op(topic, payload)
 	return op.guard(function ()
-		local reply_to = ensure_reply_to(msg, opts)
+		local reply_to = { uuid.new() }
+		local msg      = new_msg(topic, payload, reply_to)
 
-		-- Temporary subscription: not scope-bound; bracket guarantees cleanup.
 		return op.bracket(
 			function ()
-				return self:subscribe(reply_to, {
-					replay_retained = false,
-					queue_len       = opts.queue_len,
-					scope_bound     = false,
-				})
+				-- Keep the first reply; drop later ones.
+				return self:subscribe(reply_to, 1, 'drop_newest')
 			end,
-			function (sub, _aborted)
-				sub:unsubscribe()
-			end,
+			function (sub) sub:unsubscribe() end,
 			function (sub)
-				self:publish(msg)
-				return sub:next_msg_op(timeout)
+				self._bus:_publish(msg)
+				return sub:next_msg_op()
 			end
 		)
 	end)
 end
 
----@param msg Message
----@param opts? table
----@return Message|nil reply, string|nil err
-function Connection:request_once(msg, opts)
-	return perform(self:request_once_op(msg, opts))
-end
-
--- Backwards-compatibility / requested naming:
-Connection.request = Connection.request_sub
-
 --------------------------------------------------------------------------------
--- Bus
+-- Bus public API
 --------------------------------------------------------------------------------
-
----@class Bus
----@field _q_length integer
----@field _topics any
----@field _retained any
-local Bus = {}
-Bus.__index = Bus
-
-local DEFAULT_Q_LEN = 10
-
----@param params? { q_length?:integer, s_wild?:any, m_wild?:any }
----@return Bus
-local function new(params)
-	params = params or {}
-
-	local s_wild = params.s_wild or '+'
-	local m_wild = params.m_wild or '#'
-
-	return setmetatable({
-		_q_length = params.q_length or DEFAULT_Q_LEN,
-		_topics   = trie.new_pubsub(s_wild, m_wild),
-		_retained = trie.new_retained(s_wild, m_wild),
-	}, Bus)
-end
 
 --- Create a connection bound to the current scope.
----@return Connection
+---@return Connection conn
 function Bus:connect()
 	local s = scope_mod.current()
-	local conn = new_connection(self)
+	local conn = new_connection(self, self._q_length, self._full)
 
-	s:finally(function ()
-		conn:disconnect()
-	end)
+	self._conns[conn] = true
+	s:finally(function () conn:disconnect() end)
 
 	return conn
 end
 
---- Internal: best-effort enqueue (never blocks).
-local function best_effort_put(ch, msg)
-	-- Drop if not immediately possible.
-	perform(ch:put_op(msg):or_else(function () end))
-end
-
---- Internal: subscribe implementation.
-function Bus:_subscribe(conn, topic, qlen, replay_retained)
-	local bucket = self._topics:retrieve(topic)
-	if not bucket then
-		bucket = { subs = {} }
-		self._topics:insert(topic, bucket)
+--- Return a small stats snapshot for this bus instance.
+---@return table
+function Bus:stats()
+	local connections, dropped = 0, 0
+	for conn in pairs(self._conns) do
+		connections = connections + 1
+		dropped = dropped + conn:dropped()
 	end
-
-	local ch  = channel.new(qlen)
-	local sub = new_subscription(conn, topic, ch)
-	bucket.subs[#bucket.subs + 1] = sub
-
-	-- Replay retained messages that match the subscription pattern.
-	if replay_retained then
-		self._retained:each(topic, function (retained_msg)
-			best_effort_put(ch, retained_msg)
-		end)
-	end
-
-	return sub
-end
-
---- Internal: unsubscribe implementation (idempotent).
---- Pure removal from the pubsub trie; does not touch subscription closure.
-function Bus:_unsubscribe(sub)
-	local topic  = sub._topic
-	local bucket = self._topics:retrieve(topic)
-	if not bucket then
-		return true
-	end
-
-	local subs = bucket.subs
-	for i = #subs, 1, -1 do
-		if subs[i] == sub then
-			table.remove(subs, i)
-			break
-		end
-	end
-
-	if #subs == 0 then
-		self._topics:delete(topic)
-	end
-
-	return true
-end
-
---- Publish a message (best-effort fanout).
----@param msg Message
-function Bus:publish(msg)
-	assert(getmetatable(msg) == Message, 'publish expects a Message')
-
-	-- Fanout to matching subscriptions.
-	self._topics:each(msg.topic, function (bucket)
-		local subs = bucket.subs
-		for i = 1, #subs do
-			local sub = subs[i]
-			if sub and not sub._closed then
-				best_effort_put(sub._ch, msg)
-			end
-		end
-	end)
-
-	-- Retained message policy.
-	if msg.retained then
-		if msg.payload == nil then
-			self._retained:delete(msg.topic)
-		else
-			self._retained:insert(msg.topic, msg)
-		end
-	end
-
-	return true
+	return {
+		connections = connections,
+		dropped     = dropped,
+		queue_len   = self._q_length,
+		full_policy = self._full,
+	}
 end
 
 --------------------------------------------------------------------------------
--- Public API
+-- Constructor
 --------------------------------------------------------------------------------
 
-return {
-	new     = new,
-	Bus     = Bus,
+--- Create a new in-process bus.
+---@param params? { q_length?: integer, full?: FullPolicy, s_wild?: string, m_wild?: string }
+---@return Bus bus
+local function new(params)
+	params = params or {}
 
-	Message = Message,
-	new_msg = new_msg,
-}
+	local q_length = params.q_length
+	if q_length == nil then q_length = DEFAULT_Q_LEN end
+	assert(type(q_length) == 'number' and q_length >= 0, 'bus.new: q_length must be >= 0')
+
+	local full_default = assert_full_policy(params.full, 2) or DEFAULT_POLICY
+	local s_wild = params.s_wild or '+'
+	local m_wild = params.m_wild or '#'
+
+	return setmetatable({
+		_q_length = q_length,
+		_full     = full_default,
+		_topics   = trie.new_pubsub(s_wild, m_wild),
+		_retained = trie.new_retained(s_wild, m_wild),
+		_conns    = setmetatable({}, { __mode = 'k' }),
+	}, Bus)
+end
+
+return { new = new }
