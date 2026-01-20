@@ -14,7 +14,7 @@ local op        = require 'fibers.op'
 local performer = require 'fibers.performer'
 local scope_mod = require 'fibers.scope'
 local runtime   = require 'fibers.runtime'
-local sleep     = require 'fibers.sleep'
+local wait      = require 'fibers.wait'
 
 local trie = require 'trie'
 local uuid = require 'uuid'
@@ -790,96 +790,191 @@ function Connection:call_op(topic, payload, opts)
 		local request_id  = (opts.request_id ~= nil) and opts.request_id or uuid.new()
 		local reply_topic = { request_id }
 
-		-- One-shot worker control.
-		local cancelled = false
-		local rep_ep    = nil
+		-- Bind reply endpoint first to avoid racing a fast responder.
+		-- Use bracket so abort/cleanup unbinds it.
+		return op.bracket(
+			function ()
+				return self:bind(reply_topic, { queue_len = 1 })
+			end,
+			function (rep_ep)
+				if rep_ep then pcall(function () rep_ep:unbind() end) end
+			end,
+			function (rep_ep)
+				-- Internal state machine (no worker fibre).
+				local phase    = 'publish' -- 'publish' -> 'wait_reply'
+				local next_try = runtime.now()
+				local b        = backoff
 
-		local function try_fn()
-			return false
-		end
+				-- Precompute callee route key (topic is concrete).
+				local callee_key = topic_key(topic)
 
-		local function block_fn(suspension, wrap_fn)
-			-- Ensure we unbind reply endpoint (if created) on abort/cleanup.
-			suspension:add_cleanup(function ()
-				cancelled = true
-				if rep_ep then
-					-- idempotent; also detaches its finaliser
-					pcall(function () rep_ep:unbind() end)
-					rep_ep = nil
-				end
-			end)
-
-			-- Worker fibre does the retry+wait and completes the suspension.
-			runtime.spawn_raw(function ()
-				-- Bind reply endpoint first to avoid racing a fast responder.
-				local ok_bind, bind_err = pcall(function ()
-					rep_ep = self:bind(reply_topic, { queue_len = 1 })
-				end)
-				if not ok_bind then
-					if suspension:waiting() then suspension:complete(wrap_fn, nil, tostring(bind_err)) end
-					return
+				-- Check whether reply mailbox already has a buffered message.
+				-- This must be observational (no popping).
+				local function reply_buffered()
+					local rx = rep_ep and rep_ep._rx
+					local st = rx and rx._st
+					local buf = st and st.buf
+					return (buf and buf:length() > 0) or false
 				end
 
-				local function finish(v, err)
-					if rep_ep then
-						pcall(function () rep_ep:unbind() end)
-						rep_ep = nil
+				local function reply_closed()
+					local rx = rep_ep and rep_ep._rx
+					local st = rx and rx._st
+					return (not st) or st.closed or false
+				end
+
+				-- Attempt a single point-to-point publish without yielding.
+				-- Returns: ok:boolean, reason:any|nil
+				local function try_publish_once()
+					local ep = bus._endpoints and bus._endpoints[callee_key] or nil
+					if not ep or not ep._tx then
+						return false, 'no_route'
 					end
-					if suspension:waiting() then
-						suspension:complete(wrap_fn, v, err)
+
+					local msg = new_msg(topic, payload, reply_topic, request_id)
+
+					-- Use mailbox send_op's try_fn directly (non-yielding).
+					local send_op = ep._tx:send_op(msg)
+					local r1, r2, r3 = send_op.try_fn()
+
+					-- mailbox send semantics:
+					--   ready==true, ok==true              accepted
+					--   ready==true, ok==false, "full"     rejected by policy
+					--   ready==true, ok==nil               closed
+					--   ready==false                       would block (not possible for reject_newest/drop_oldest)
+					if not r1 then
+						-- Should not happen with bounded non-blocking policies.
+						return false, 'would_block'
 					end
+					if r2 == true then return true, nil end
+					if r2 == nil then return false, 'closed' end
+					return false, r3 or 'full'
 				end
 
-				-- Retry publish_one until accepted or deadline/cancel.
-				local b = backoff
-				while true do
-					if cancelled then return finish(nil, 'cancelled') end
+				-- Attempt a single reply receive without yielding.
+				-- Returns: have:boolean, payload:any|nil, err:any|nil
+				local function try_recv_reply()
+					-- Use raw mailbox recv_op's try_fn directly (non-yielding).
+					local rxop = rep_ep._rx:recv_op()
+					local ready, v = rxop.try_fn()
+					if not ready then
+						return false, nil, nil
+					end
+					if v == nil then
+						-- closed and drained
+						return true, nil, 'closed'
+					end
+					-- v is Message
+					return true, v.payload, nil
+				end
 
+				-- Probe step: observational only; never performs side effects.
+				local function probe_step()
 					local now = runtime.now()
 					if now >= deadline then
-						return finish(nil, 'timeout')
+						return true, function () return nil, 'timeout' end
 					end
 
-					local ok_pub, reason = perform(self:publish_one_op(topic, payload, {
-						reply_to = reply_topic,
-						id       = request_id,
-					}))
-
-					if ok_pub then break end
-
-					-- Decide retry policy.
-					if reason ~= 'full' and reason ~= 'no_route' and reason ~= 'closed' then
-						return finish(nil, tostring(reason))
+					-- If reply already buffered, ask to run immediately.
+					if phase == 'wait_reply' and reply_buffered() then
+						return false, 'run'
 					end
 
-					local remaining = deadline - runtime.now()
-					local dt = math.min(b, backoff_max, remaining)
-					if dt <= 0 then
-						return finish(nil, 'timeout')
+					-- If reply endpoint is closed (and no buffered reply), this is terminal.
+					if phase == 'wait_reply' and reply_closed() and not reply_buffered() then
+						return true, function () return nil, 'closed' end
 					end
-					perform(sleep.sleep_op(dt))
-					b = math.min(b * 2, backoff_max)
+
+					if phase == 'publish' then
+						if now >= next_try then
+							return false, 'run'
+						end
+						return false, 'timer'
+					end
+
+					-- wait_reply
+					return false, 'any'
 				end
 
-				-- Wait for reply or deadline.
-				local is_reply, msg, err = perform(op.boolean_choice(
-					rep_ep:recv_op(), -- returns msg, err
-					sleep.sleep_until_op(deadline):wrap(function ()
-						return nil, 'timeout'
+				-- Run step: performs bounded, non-yielding progress.
+				-- Returns either (true, thunk) terminal, or (false, want) to block.
+				local function run_step()
+					local now = runtime.now()
+					if now >= deadline then
+						return true, function () return nil, 'timeout' end
+					end
+
+					if phase == 'publish' then
+						if now < next_try then
+							return false, 'timer'
+						end
+
+						local ok_pub, reason = try_publish_once()
+						if ok_pub then
+							phase = 'wait_reply'
+							-- Fall through to reply attempt in the same tick.
+						else
+							-- Retry policy matches previous implementation.
+							if reason ~= 'full' and reason ~= 'no_route' and reason ~= 'closed' then
+								return true, function () return nil, tostring(reason) end
+							end
+
+							local remaining = deadline - runtime.now()
+							local dt = math.min(b, backoff_max, remaining)
+							if dt <= 0 then
+								return true, function () return nil, 'timeout' end
+							end
+
+							next_try = runtime.now() + dt
+							b = math.min(b * 2, backoff_max)
+							return false, 'timer'
+						end
+					end
+
+					-- phase == 'wait_reply'
+					local have, payload_out, err = try_recv_reply()
+					if have then
+						if err ~= nil then
+							return true, function () return nil, err end
+						end
+						return true, function () return payload_out, nil end
+					end
+
+					-- Not ready: wait for either reply or deadline.
+					return false, 'any'
+				end
+
+				-- Registration: arm wake-ups without exposing the scheduler.
+				---@param task Task
+				---@param waker table
+				---@param want any
+				local function register(task, waker, want)
+					-- Always arm the deadline timer (cannot cancel; benign if it fires after completion).
+					waker:at_time(deadline, task)
+
+					if want == 'run' then
+						waker:wakeup(task)
+						return { unlink = function () return false end }
+					end
+
+					if want == 'timer' then
+						waker:at_time(next_try, task)
+						return { unlink = function () return false end }
+					end
+
+					-- want == 'any' (or anything else): wait for reply arrival and deadline.
+					-- Rx:on_message uses the waker; no scheduler is referenced.
+					local tok = rep_ep._rx:on_message(task, waker)
+					return tok or { unlink = function () return false end }
+				end
+
+				-- Build the op: waitable2 returns packed results; we always return a thunk.
+				return wait.waitable2(register, probe_step, run_step)
+					:wrap(function (th)
+						return th()
 					end)
-				))
-
-				if cancelled then return finish(nil, 'cancelled') end
-				if not is_reply then return finish(nil, 'timeout') end
-				if err then return finish(nil, err) end
-				if not msg then return finish(nil, 'closed') end
-
-				return finish(msg.payload, nil)
-			end)
-		end
-
-		-- Primitive op: completion values are already (reply, err).
-		return op.new_primitive(nil, try_fn, block_fn)
+			end
+		)
 	end)
 end
 
