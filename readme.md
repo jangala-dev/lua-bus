@@ -2,7 +2,7 @@
 
 ## Overview
 
-The `bus` module provides an in-process pub/sub messaging bus built on `fibers` and a Trie-based topic matcher.
+The `bus` module provides an in-process pub/sub messaging bus built on `fibers` and a trie-based topic matcher.
 
 It is intended for cooperative, single-threaded systems running under `fibers.run(...)`, where:
 
@@ -11,7 +11,7 @@ It is intended for cooperative, single-threaded systems running under `fibers.ru
 
 The bus uses two tries:
 
-* a **pubsub trie** for wildcard subscriptions (wildcards allowed in stored keys),
+* a **pubsub trie** for wildcard subscriptions (wildcards allowed in stored keys; queries are literal), and
 * a **retained trie** for retained state (stored keys are literal; wildcards allowed in queries).
 
 ## Key ideas
@@ -27,10 +27,10 @@ The bus uses two tries:
 * Publishing is **best-effort fanout**:
 
   * the bus attempts a single non-blocking enqueue per subscription,
-  * if enqueue would block, the message is dropped for that subscription.
+  * if enqueue would block or is rejected by policy, the message is dropped for that subscription.
 * Timeouts are not built in; compose them externally using `fibers.named_choice` / `fibers.choice` plus `fibers.sleep.sleep_op`.
 
-## Topics and wildcards
+## Topics, wildcards, and literals
 
 Topics are token arrays (dense tables indexed `1..n`), e.g.
 
@@ -43,23 +43,37 @@ Wildcards are supported in subscription patterns:
 * single-level wildcard token: `+` (configurable via `s_wild`)
 * multi-level wildcard token: `#` (configurable via `m_wild`)
 
+### Literal tokens (escaping wildcards)
+
+If you need to use the wildcard symbols as ordinary tokens, wrap them with `bus.literal(...)` (re-exported from `trie.literal`):
+
+```lua
+local Bus = require 'bus'
+
+local topic = { 'cfg', Bus.literal('+') }  -- matches the literal "+" token
+```
+
+A literal token is treated as concrete for endpoint binding and request/reply topics.
+
 ## Delivery, queues, and full policy
 
 Each subscription has:
 
 * `queue_len` (number, **≥ 0**)
-* `full_policy`:
+* `full` policy:
 
   * `"drop_oldest"` (default)
-  * `"drop_newest"`
+  * `"reject_newest"`
   * `"block"` is rejected (this bus must remain bounded and non-blocking)
+
+`"drop_newest"` is deprecated and not supported; use `"reject_newest"`.
 
 ### Queue length = 0 (rendezvous subscriptions)
 
 A `queue_len` of `0` creates a rendezvous-style subscription:
 
 * delivery succeeds only if a receiver is waiting at publish time,
-* otherwise delivery would block, so the bus drops the message.
+* otherwise delivery would block, so the bus drops (or rejects) the message.
 
 This is useful for “only if someone is listening right now” topics.
 
@@ -70,12 +84,17 @@ Drops are tracked per-subscription and can be queried:
 * `sub:dropped()` — drops for that subscription
 * `conn:dropped()` — sum of drops across subscriptions owned by the connection (computed at query time)
 
+The counter aggregates both:
+
+* buffered evictions under `"drop_oldest"`, and
+* rejections under `"reject_newest"`.
+
 ## Installation
 
 Dependencies:
 
 * `fibers` (`fibers.op`, `fibers.performer`, `fibers.scope`, `fibers.mailbox`)
-* `trie` (pubsub + retained)
+* `trie` (pubsub + retained; supports `trie.literal`)
 * `uuid`
 
 Load:
@@ -91,32 +110,53 @@ local Bus = require 'bus'
 * `Bus.new(params?) -> bus`
 * `bus:connect() -> conn`
 * `bus:stats() -> table`
+* `Bus.literal(v) -> literal_token` (or `require('bus').literal(v)`)
 
 ### Connection
 
-* `conn:publish(topic, payload) -> true`
-* `conn:retain(topic, payload) -> true`
+* `conn:publish(topic, payload[, opts]) -> true`
+* `conn:retain(topic, payload[, opts]) -> true`
 * `conn:unretain(topic) -> true`
-* `conn:subscribe(topic, queue_len?, full_policy?) -> sub`
+* `conn:subscribe(topic[, opts]) -> sub`
 * `conn:unsubscribe(sub) -> true`
 * `conn:disconnect() -> true`
 * `conn:is_disconnected() -> boolean`
 * `conn:dropped() -> number`
 * `conn:stats() -> table`
-* `conn:request_sub(topic, payload, queue_len?, full_policy?) -> sub`
-* `conn:request_once_op(topic, payload) -> Op`
+* `conn:request_sub(topic, payload[, opts]) -> sub`
+* `conn:request_once_op(topic, payload[, opts]) -> Op`
+
+Lane B (opt-in):
+
+* `conn:bind(topic[, opts]) -> endpoint`
+* `conn:unbind(endpoint) -> true`
+* `conn:publish_one_op(topic, payload[, opts]) -> Op`
+* `conn:publish_one(topic, payload[, opts]) -> boolean, reason|nil`
+* `conn:call_op(topic, payload[, opts]) -> Op`
+* `conn:call(topic, payload[, opts]) -> reply|nil, err|nil`
 
 ### Subscription
 
-* `sub:next_msg_op() -> Op` yielding `(Message|nil, err|string|nil)`
-* `sub:next_msg() -> Message|nil, err|string|nil`
+* `sub:recv_op() -> Op` yielding `(Message|nil, err|string|nil)`
+* `sub:recv() -> Message|nil, err|string|nil`
 * `sub:unsubscribe() -> true`
-* `sub:messages() -> iterator<Message>`
+* `sub:iter() -> iterator<Message>`
 * `sub:payloads() -> iterator<any>`
 * `sub:why() -> any|nil`
 * `sub:dropped() -> number`
 * `sub:topic() -> Topic`
 * `sub:stats() -> table`
+
+### Endpoint (lane B)
+
+* `ep:recv_op() -> Op` yielding `(Message|nil, err|string|nil)`
+* `ep:recv() -> Message|nil, err|string|nil`
+* `ep:iter() -> iterator<Message>`
+* `ep:payloads() -> iterator<any>`
+* `ep:unbind() -> true`
+* `ep:why() -> any|nil`
+* `ep:dropped() -> number`
+* `ep:topic() -> Topic`
 
 ## Usage
 
@@ -126,7 +166,7 @@ local Bus = require 'bus'
 local Bus = require 'bus'
 
 local bus = Bus.new{
-  q_length = 10,          -- default queue length for subscriptions
+  q_length = 10,            -- default queue length for subscriptions
   full     = 'drop_oldest', -- default full policy
   s_wild   = '+',
   m_wild   = '#',
@@ -147,7 +187,7 @@ local conn = bus:connect()
 conn:publish({ 'net', 'link' }, { ifname = 'eth0', up = true })
 ```
 
-Publishing never blocks. If a subscriber cannot accept immediately, that subscriber drops.
+Publishing never blocks. If a subscriber cannot accept immediately, that subscriber drops (or rejects) the message.
 
 ### Retain and unretain
 
@@ -174,21 +214,21 @@ local sub = conn:subscribe({ 'fw', '#' })
 Override queue length and policy:
 
 ```lua
-local sub = conn:subscribe({ 'net', '+' }, 50, 'drop_newest')
+local sub = conn:subscribe({ 'net', '+' }, { queue_len = 50, full = 'reject_newest' })
 ```
 
 Rendezvous subscription (bounded, non-blocking):
 
 ```lua
-local sub = conn:subscribe({ 'events', 'transient' }, 0, 'drop_newest')
+local sub = conn:subscribe({ 'events', 'transient' }, { queue_len = 0, full = 'reject_newest' })
 ```
 
 ### Receive (sync) and compose a timeout (recommended)
 
-`next_msg()` blocks until a message arrives or the subscription closes:
+`recv()` blocks until a message arrives or the subscription closes:
 
 ```lua
-local msg, err = sub:next_msg()
+local msg, err = sub:recv()
 if msg then
   print(msg.payload)
 else
@@ -203,7 +243,7 @@ local fibers = require 'fibers'
 local sleep  = require 'fibers.sleep'
 
 local ev = fibers.named_choice{
-  msg      = sub:next_msg_op(),
+  msg      = sub:recv_op(),
   deadline = sleep.sleep_op(1.0),
 }
 
@@ -219,7 +259,7 @@ end
 
 ```lua
 sub:unsubscribe()   -- idempotent, wakes waiters
-conn:disconnect()   -- idempotent, closes all owned subs
+conn:disconnect()   -- idempotent, closes all owned subs/endpoints
 ```
 
 ## Request/reply
@@ -232,18 +272,17 @@ Creates a fresh `reply_to` topic, subscribes to it first, then publishes the req
 local replies = conn:request_sub(
   { 'rpc', 'get_status' },
   { verbose = true },
-  10,
-  'drop_oldest'
+  { queue_len = 10, full = 'drop_oldest' }
 )
 
-for msg in replies:messages() do
+for msg in replies:iter() do
   print('reply:', msg.payload)
 end
 ```
 
 ### Single reply: `request_once_op`
 
-Returns an `Op` that yields the first reply message (or closes). It uses a temporary subscription with `queue_len = 1` and `'drop_newest'`, and always unsubscribes via `op.bracket`.
+Returns an `Op` that yields the first reply message (or closes). It uses a temporary subscription with `queue_len = 1` and `'reject_newest'`, and always unsubscribes via `op.bracket`.
 
 ```lua
 local fibers = require 'fibers'
@@ -266,4 +305,4 @@ end
 
 * Delivery is best-effort; drops are expected under overload.
 * Retained replay is also best-effort and bounded (a new subscription may drop retained replays if it cannot accept immediately).
-* `full_policy = "block"` is intentionally not supported by the bus.
+* `full = "block"` is intentionally not supported by the bus.
