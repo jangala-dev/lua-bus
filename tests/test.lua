@@ -62,6 +62,51 @@ local function reply_best_effort(conn, reply_to, payload, opts)
 end
 
 --------------------------------------------------------------------------------
+-- Authz test helpers
+--------------------------------------------------------------------------------
+
+local function principal_with_roles(kind, id, roles)
+	return {
+		kind  = kind,
+		id    = id,
+		roles = roles or {},
+	}
+end
+
+local function admin_principal(id)
+	return principal_with_roles('user', id or 'admin', { 'admin' })
+end
+
+local function viewer_principal(id)
+	return principal_with_roles('user', id or 'viewer', { 'viewer' })
+end
+
+local function has_role(principal, wanted)
+	local roles = principal and principal.roles
+	if type(roles) ~= 'table' then return false end
+	for i = 1, #roles do
+		if roles[i] == wanted then return true end
+	end
+	return false
+end
+
+local function new_admin_only_authoriser(log)
+	return {
+		allow = function(_, ctx)
+			if log then
+				log[#log + 1] = ctx
+			end
+
+			if has_role(ctx.principal, 'admin') then
+				return true, nil
+			end
+
+			return false, 'forbidden'
+		end,
+	}
+end
+
+--------------------------------------------------------------------------------
 -- Test Simple PubSub (direct op performance)
 --------------------------------------------------------------------------------
 
@@ -833,6 +878,154 @@ local function test_scope_cancellation_terminates_waits()
 end
 
 --------------------------------------------------------------------------------
+-- Authz / principals
+--------------------------------------------------------------------------------
+
+local function test_authz_denies_without_admin_role()
+	local bus = Bus.new({
+		m_wild      = '#',
+		s_wild      = '+',
+		authoriser  = new_admin_only_authoriser(),
+	})
+
+	local conn_missing = bus:connect()
+	local ok1, err1 = pcall(function()
+		conn_missing:subscribe({ 'authz', 'deny', 'sub' })
+	end)
+	assert(not ok1, 'expected subscribe without principal to be denied')
+	assert(tostring(err1):match('permission denied'), tostring(err1))
+
+	local conn_viewer = bus:connect({ principal = viewer_principal('alice') })
+	local ok2, err2 = pcall(function()
+		conn_viewer:publish({ 'authz', 'deny', 'pub' }, 'x')
+	end)
+	assert(not ok2, 'expected publish without admin role to be denied')
+	assert(tostring(err2):match('permission denied'), tostring(err2))
+
+	local ok3, err3 = pcall(function()
+		conn_viewer:bind({ 'authz', 'deny', 'bind' })
+	end)
+	assert(not ok3, 'expected bind without admin role to be denied')
+	assert(tostring(err3):match('permission denied'), tostring(err3))
+
+	local ok4, err4 = pcall(function()
+		fibers.perform(conn_viewer:call_op({ 'authz', 'deny', 'call' }, 'x', { timeout = TMO }))
+	end)
+	assert(not ok4, 'expected call_op perform without admin role to be denied')
+	assert(tostring(err4):match('permission denied'), tostring(err4))
+
+	print('Authz deny test passed!')
+end
+
+local function test_authz_admin_allows_and_records_actions()
+	local seen = {}
+	local bus = Bus.new({
+		m_wild      = '#',
+		s_wild      = '+',
+		authoriser  = new_admin_only_authoriser(seen),
+	})
+
+	local admin1 = admin_principal('root')
+	local admin2 = admin_principal('helper')
+
+	local conn1 = bus:connect({ principal = admin1 })
+	local conn2 = bus:connect({ principal = admin2 })
+
+	assert(conn1:principal() == admin1, 'expected principal() to return supplied principal')
+
+	-- subscribe + publish
+	local sub = conn1:subscribe({ 'authz', 'pubsub' })
+	conn1:publish({ 'authz', 'pubsub' }, 'hello')
+	do
+		local msg, err = fibers.perform(sub:recv_op())
+		assert(err == nil and msg and msg.payload == 'hello')
+	end
+
+	-- retain + unretain
+	conn1:retain({ 'authz', 'retained' }, 'R')
+	local sub_ret = conn1:subscribe({ 'authz', 'retained' })
+	do
+		local msg, err = fibers.perform(sub_ret:recv_op())
+		assert(err == nil and msg and msg.payload == 'R')
+	end
+	conn1:unretain({ 'authz', 'retained' })
+	local sub_ret2 = conn1:subscribe({ 'authz', 'retained' })
+	do
+		local which, msg, err = select_named({
+			msg      = sub_ret2:recv_op(),
+			deadline = timeout_op(TMO),
+		})
+		assert_eq(which, 'deadline')
+		assert_timeout(msg, err)
+	end
+
+	-- bind + publish_one
+	local ep = conn1:bind({ 'authz', 'ep' }, { queue_len = 1 })
+	do
+		local ok, reason = conn1:publish_one({ 'authz', 'ep' }, 'E')
+		assert_eq(ok, true)
+		assert(reason == nil)
+	end
+	do
+		local msg, err = fibers.perform(ep:recv_op())
+		assert(err == nil and msg and msg.payload == 'E')
+	end
+
+	-- request_sub
+	fibers.spawn(function()
+		local helper_sub = conn2:subscribe({ 'authz', 'request' })
+		local msg, err = helper_sub:recv()
+		assert(msg, tostring(err))
+		local ok, why = reply_best_effort(conn2, msg.reply_to, 'reply:' .. tostring(msg.payload), { id = msg.id })
+		assert(ok, tostring(why))
+	end)
+	Sleep.sleep(TMO)
+	local req_sub = conn1:request_sub({ 'authz', 'request' }, 'Q')
+	do
+		local which, msg, err = select_named({
+			reply    = req_sub:recv_op(),
+			deadline = timeout_op(LONG_TMO),
+		})
+		assert_eq(which, 'reply')
+		assert(err == nil and msg and msg.payload == 'reply:Q')
+	end
+	req_sub:unsubscribe()
+
+	-- call
+	local rpc_ep = conn2:bind({ 'authz', 'rpc' }, { queue_len = 1 })
+	fibers.spawn(function()
+		local msg, err = rpc_ep:recv()
+		assert(msg, tostring(err))
+		local ok, why = reply_best_effort(conn2, msg.reply_to, 'rpc:' .. tostring(msg.payload), { id = msg.id })
+		assert(ok, tostring(why))
+	end)
+	do
+		local reply, err = conn1:call({ 'authz', 'rpc' }, 'C', { timeout = LONG_TMO })
+		assert(err == nil, tostring(err))
+		assert_eq(reply, 'rpc:C')
+	end
+	rpc_ep:unbind()
+	ep:unbind()
+
+	local actions = {}
+	for i = 1, #seen do
+		local ctx = seen[i]
+		actions[ctx.action] = true
+	end
+
+	assert(actions.subscribe,   'expected subscribe action to be authorised')
+	assert(actions.publish,     'expected publish action to be authorised')
+	assert(actions.retain,      'expected retain action to be authorised')
+	assert(actions.unretain,    'expected unretain action to be authorised')
+	assert(actions.bind,        'expected bind action to be authorised')
+	assert(actions.publish_one, 'expected publish_one action to be authorised')
+	assert(actions.request,     'expected request action to be authorised')
+	assert(actions.call,        'expected call action to be authorised')
+
+	print('Authz admin allow/record test passed!')
+end
+
+--------------------------------------------------------------------------------
 -- Run
 --------------------------------------------------------------------------------
 
@@ -870,6 +1063,8 @@ fibers.run(function ()
 	test_request_once_deadline_no_responder()
 
 	test_scope_cancellation_terminates_waits()
+	test_authz_denies_without_admin_role()
+	test_authz_admin_allows_and_records_actions()
 
 	print('ALL TESTS PASSED!')
 end)

@@ -5,8 +5,9 @@
 --  - retained messages (retained trie: literal stored keys; wildcards allowed in queries)
 --  - request/response helpers (reply_to topic)
 --
--- Optional extension (lane B):
---  - bind/publish_one/call_op for admission-signalled point-to-point delivery
+-- Optional extensions:
+--  - lane B: bind/publish_one/call_op for admission-signalled point-to-point delivery
+--  - authz : principal-aware authorisation hooks on connection actions
 ---@module 'bus'
 
 local mailbox   = require 'fibers.mailbox'
@@ -153,6 +154,105 @@ local function topic_key(topic)
 		end
 	end
 	return table.concat(parts, '|')
+end
+
+---@param topic Topic
+---@return string
+local function topic_debug(topic)
+	local n = array_len(topic, 3)
+	local parts = {}
+	for i = 1, n do
+		local raw, was_lit = unwrap_token(topic[i])
+		parts[i] = was_lit and ('=' .. tostring(raw)) or tostring(raw)
+	end
+	return table.concat(parts, '/')
+end
+
+--------------------------------------------------------------------------------
+-- Authorisation
+--------------------------------------------------------------------------------
+
+--- Resolve an authoriser callable from:
+---   * function(ctx) -> boolean|nil, reason?
+---   * table:allow(ctx) -> boolean|nil, reason?
+---   * table:authorize(ctx) -> boolean|nil, reason?
+---@param auth any
+---@return function|nil
+local function authoriser_callable(auth)
+	if auth == nil then return nil end
+	if type(auth) == 'function' then
+		return function(ctx)
+			return auth(ctx)
+		end
+	end
+	if type(auth) == 'table' then
+		if type(auth.allow) == 'function' then
+			return function(ctx)
+				return auth:allow(ctx)
+			end
+		end
+		if type(auth.authorize) == 'function' then
+			return function(ctx)
+				return auth:authorize(ctx)
+			end
+		end
+	end
+	return nil
+end
+
+---@param bus Bus
+---@param principal any
+---@param action string
+---@param topic Topic
+---@param extra? table
+---@param level? integer
+---@return boolean ok
+---@return any reason
+local function authorize_action(bus, principal, action, topic, extra, level)
+	level = (level or 1) + 1
+
+	local auth = bus and bus._authoriser or nil
+	if auth == nil then
+		return true, nil
+	end
+
+	local fn = authoriser_callable(auth)
+	if not fn then
+		error('bus authoriser must be a function or table with :allow(ctx) / :authorize(ctx)', level)
+	end
+
+	local ok, reason = fn({
+		bus       = bus,
+		principal = principal,
+		action    = action,
+		topic     = topic,
+		extra     = extra,
+	})
+
+	if ok == false or ok == nil then
+		return false, reason or 'forbidden'
+	end
+	return true, nil
+end
+
+---@param self Connection
+---@param action string
+---@param topic Topic
+---@param extra? table
+---@param level? integer
+local function assert_authorized(self, action, topic, extra, level)
+	level = (level or 1) + 1
+	local ok, reason = authorize_action(self._bus, self._principal, action, topic, extra, level)
+	if not ok then
+		error(
+			('permission denied for %s on %s: %s'):format(
+				tostring(action),
+				topic_debug(topic),
+				tostring(reason or 'forbidden')
+			),
+			level
+		)
+	end
 end
 
 --------------------------------------------------------------------------------
@@ -341,6 +441,7 @@ end
 ---@field _s_wild string|number
 ---@field _m_wild string|number
 ---@field _endpoints table<string, Endpoint>
+---@field _authoriser any|nil
 local Bus = {}
 Bus.__index = Bus
 
@@ -420,6 +521,7 @@ end
 
 ---@class Connection
 ---@field _bus Bus|nil
+---@field _principal any|nil
 ---@field _q_length integer
 ---@field _full FullPolicy
 ---@field _subs table<Subscription, boolean>
@@ -434,9 +536,10 @@ local function assert_connected(self, level)
 	end
 end
 
-local function new_connection(bus, q_length, full)
+local function new_connection(bus, principal, q_length, full)
 	return setmetatable({
 		_bus          = bus,
+		_principal    = principal,
 		_q_length     = q_length,
 		_full         = full,
 		_subs         = {},
@@ -447,6 +550,10 @@ end
 
 function Connection:is_disconnected()
 	return self._disconnected
+end
+
+function Connection:principal()
+	return self._principal
 end
 
 function Connection:dropped()
@@ -472,6 +579,12 @@ function Connection:publish(topic, payload, opts)
 		assert_topic(reply_to, 'reply_to', 2)
 	end
 
+	assert_authorized(self, 'publish', topic, {
+		payload  = payload,
+		reply_to = reply_to,
+		id       = opts.id,
+	}, 1)
+
 	self._bus:_publish(new_msg(topic, payload, reply_to, opts.id))
 	return true
 end
@@ -486,6 +599,12 @@ function Connection:retain(topic, payload, opts)
 		assert_topic(reply_to, 'reply_to', 2)
 	end
 
+	assert_authorized(self, 'retain', topic, {
+		payload  = payload,
+		reply_to = reply_to,
+		id       = opts.id,
+	}, 1)
+
 	self._bus:_retain(new_msg(topic, payload, reply_to, opts.id))
 	return true
 end
@@ -493,25 +612,30 @@ end
 function Connection:unretain(topic)
 	assert_connected(self, 1)
 	assert_topic(topic, 'topic', 1)
+
+	assert_authorized(self, 'unretain', topic, nil, 1)
+
 	self._bus:_unretain(topic)
 	return true
 end
 
---- subscribe(topic[, opts]) -> Subscription
+--- Internal subscribe helper with no authz check.
 --- opts: { queue_len?: integer, full?: FullPolicy }
-function Connection:subscribe(topic, opts)
+---@param topic Topic
+---@param opts? table
+---@return Subscription
+function Connection:_subscribe_internal(topic, opts)
 	assert_connected(self, 1)
-	assert_topic(topic, 'topic', 1)
 
 	opts = opts or {}
 	if type(opts) ~= 'table' then
-		error('subscribe: opts must be a table (or nil)', 2)
+		error('_subscribe_internal: opts must be a table (or nil)', 2)
 	end
 
 	local qlen = opts.queue_len
 	if qlen == nil then qlen = self._q_length end
 	if type(qlen) ~= 'number' or qlen < 0 then
-		error('subscribe: queue_len must be >= 0', 2)
+		error('_subscribe_internal: queue_len must be >= 0', 2)
 	end
 
 	local fullp = assert_full_policy(opts.full or self._full, 2) or DEFAULT_POLICY
@@ -523,6 +647,19 @@ function Connection:subscribe(topic, opts)
 	sub._detach_finaliser = s:finally(function () sub:unsubscribe() end)
 
 	return sub
+end
+
+--- subscribe(topic[, opts]) -> Subscription
+--- opts: { queue_len?: integer, full?: FullPolicy }
+function Connection:subscribe(topic, opts)
+	assert_connected(self, 1)
+	assert_topic(topic, 'topic', 1)
+
+	assert_authorized(self, 'subscribe', topic, {
+		opts = opts,
+	}, 1)
+
+	return self:_subscribe_internal(topic, opts)
 end
 
 function Connection:unsubscribe(sub)
@@ -615,11 +752,16 @@ function Connection:request_sub(topic, payload, opts)
 		error('request_sub: opts must be a table (or nil)', 2)
 	end
 
+	assert_authorized(self, 'request', topic, {
+		payload = payload,
+		opts    = opts,
+	}, 1)
+
 	local reply_to = { uuid.new() }
 	local msg      = new_msg(topic, payload, reply_to)
 
 	-- Subscribe first to avoid racing a fast responder.
-	local sub = self:subscribe(reply_to, opts)
+	local sub = self:_subscribe_internal(reply_to, opts)
 	self._bus:_publish(msg)
 	return sub
 end
@@ -636,13 +778,18 @@ function Connection:request_once_op(topic, payload, opts)
 		assert_connected(self, 1)
 		assert_topic(topic, 'topic', 1)
 
+		assert_authorized(self, 'request', topic, {
+			payload = payload,
+			opts    = opts,
+		}, 1)
+
 		local reply_to = { uuid.new() }
 		local msg      = new_msg(topic, payload, reply_to)
 
 		return op.bracket(
 			function ()
 				-- Keep the first reply; reject duplicates.
-				return self:subscribe(reply_to, { queue_len = 1, full = 'reject_newest' })
+				return self:_subscribe_internal(reply_to, { queue_len = 1, full = 'reject_newest' })
 			end,
 			function (sub) sub:unsubscribe() end,
 			function (sub)
@@ -657,15 +804,17 @@ end
 -- Lane B: endpoints + publish_one + call_op (opt-in)
 --------------------------------------------------------------------------------
 
---- bind(topic[, opts]) -> Endpoint
+--- Internal bind helper with no authz check.
 --- opts: { queue_len?: integer }  (full policy is fixed to reject_newest)
-function Connection:bind(topic, opts)
+---@param topic Topic
+---@param opts? table
+---@return Endpoint
+function Connection:_bind_internal(topic, opts)
 	assert_connected(self, 1)
-	assert_topic(topic, 'topic', 1)
 
 	opts = opts or {}
 	if type(opts) ~= 'table' then
-		error('bind: opts must be a table (or nil)', 2)
+		error('_bind_internal: opts must be a table (or nil)', 2)
 	end
 
 	local bus = assert(self._bus)
@@ -674,7 +823,7 @@ function Connection:bind(topic, opts)
 	local qlen = opts.queue_len
 	if qlen == nil then qlen = 1 end
 	if type(qlen) ~= 'number' or qlen < 0 then
-		error('bind: queue_len must be >= 0', 2)
+		error('_bind_internal: queue_len must be >= 0', 2)
 	end
 
 	local key = topic_key(topic)
@@ -693,6 +842,19 @@ function Connection:bind(topic, opts)
 	ep._detach_finaliser = s:finally(function () ep:unbind() end)
 
 	return ep
+end
+
+--- bind(topic[, opts]) -> Endpoint
+--- opts: { queue_len?: integer }  (full policy is fixed to reject_newest)
+function Connection:bind(topic, opts)
+	assert_connected(self, 1)
+	assert_topic(topic, 'topic', 1)
+
+	assert_authorized(self, 'bind', topic, {
+		opts = opts,
+	}, 1)
+
+	return self:_bind_internal(topic, opts)
 end
 
 function Connection:unbind(ep)
@@ -731,6 +893,12 @@ function Connection:publish_one_op(topic, payload, opts)
 	return op.guard(function ()
 		assert_connected(self, 1)
 		assert_topic(topic, 'topic', 1)
+
+		assert_authorized(self, 'publish_one', topic, {
+			payload  = payload,
+			reply_to = opts.reply_to,
+			id       = opts.id,
+		}, 1)
 
 		local bus = assert(self._bus)
 		assert_concrete_topic(bus._s_wild, bus._m_wild, topic, 'publish_one topic', 2)
@@ -779,6 +947,11 @@ function Connection:call_op(topic, payload, opts)
 		assert_connected(self, 1)
 		assert_topic(topic, 'topic', 1)
 
+		assert_authorized(self, 'call', topic, {
+			payload = payload,
+			opts    = opts,
+		}, 1)
+
 		local bus = assert(self._bus)
 		assert_concrete_topic(bus._s_wild, bus._m_wild, topic, 'call topic', 2)
 
@@ -794,7 +967,7 @@ function Connection:call_op(topic, payload, opts)
 		-- Use bracket so abort/cleanup unbinds it.
 		return op.bracket(
 			function ()
-				return self:bind(reply_topic, { queue_len = 1 })
+				return self:_bind_internal(reply_topic, { queue_len = 1 })
 			end,
 			function (rep_ep)
 				if rep_ep then pcall(function () rep_ep:unbind() end) end
@@ -986,9 +1159,16 @@ end
 -- Bus public API
 --------------------------------------------------------------------------------
 
-function Bus:connect()
+--- connect([opts]) -> Connection
+--- opts: { principal?: any }
+function Bus:connect(opts)
+	opts = opts or {}
+	if type(opts) ~= 'table' then
+		error('connect: opts must be a table (or nil)', 2)
+	end
+
 	local s = scope_mod.current()
-	local conn = new_connection(self, self._q_length, self._full)
+	local conn = new_connection(self, opts.principal, self._q_length, self._full)
 	self._conns[conn] = true
 	s:finally(function () conn:disconnect() end)
 	return conn
@@ -1014,7 +1194,7 @@ end
 -- Constructor
 --------------------------------------------------------------------------------
 
----@param params? { q_length?: integer, full?: FullPolicy, s_wild?: string|number, m_wild?: string|number }
+---@param params? { q_length?: integer, full?: FullPolicy, s_wild?: string|number, m_wild?: string|number, authoriser?: any }
 ---@return Bus
 local function new(params)
 	params = params or {}
@@ -1038,6 +1218,7 @@ local function new(params)
 		_retained  = trie.new_retained(s_wild, m_wild),
 		_conns     = setmetatable({}, { __mode = 'k' }),
 		_endpoints = {}, -- lane B store
+		_authoriser = params.authoriser,
 	}, Bus)
 end
 
