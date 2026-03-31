@@ -30,6 +30,14 @@ local function assert_in_set(v, set, msg)
 	end
 end
 
+local function topic_str(topic)
+	local parts = {}
+	for i = 1, #(topic or {}) do
+		parts[i] = tostring(topic[i])
+	end
+	return table.concat(parts, '/')
+end
+
 -- A standard “deadline arm”: returns (nil, 'timeout').
 local function timeout_op(dt)
 	return Sleep.sleep_op(dt):wrap(function ()
@@ -341,6 +349,254 @@ local function test_retained_query_wildcards_and_unretain()
 	assert_timeout(msg, err)
 
 	print('Retained message (wildcards + unretain) test passed!')
+end
+
+--------------------------------------------------------------------------------
+-- Retained watch feed tests
+--------------------------------------------------------------------------------
+
+local function test_retained_watch_replay_and_live_changes()
+	local bus  = Bus.new({ m_wild = '#', s_wild = '+' })
+	local conn = bus:connect()
+
+	conn:retain({ 'watch', 'a' }, 'A1')
+
+	local rw = conn:watch_retained({ 'watch', '#' }, {
+		queue_len = 10,
+		full      = 'drop_oldest',
+		replay    = true,
+	})
+
+	assert_eq(conn:stats().retained_watches, 1)
+	assert_eq(bus:stats().retained_watches, 1)
+
+	do
+		local ev, err = fibers.perform(rw:recv_op())
+		assert(err == nil and ev, tostring(err))
+		assert_eq(ev.op, 'retain')
+		assert_eq(topic_str(ev.topic), 'watch/a')
+		assert_eq(ev.payload, 'A1')
+	end
+
+	conn:retain({ 'watch', 'b' }, 'B1')
+
+	do
+		local ev, err = fibers.perform(rw:recv_op())
+		assert(err == nil and ev, tostring(err))
+		assert_eq(ev.op, 'retain')
+		assert_eq(topic_str(ev.topic), 'watch/b')
+		assert_eq(ev.payload, 'B1')
+	end
+
+	conn:unretain({ 'watch', 'a' })
+
+	do
+		local ev, err = fibers.perform(rw:recv_op())
+		assert(err == nil and ev, tostring(err))
+		assert_eq(ev.op, 'unretain')
+		assert_eq(topic_str(ev.topic), 'watch/a')
+		assert(ev.payload == nil, 'expected nil payload for unretain')
+	end
+
+	-- Ordinary publish should not appear on retained watch feeds.
+	conn:publish({ 'watch', 'c' }, 'PUBONLY')
+
+	do
+		local which, ev, err = select_named({
+			ev       = rw:recv_op(),
+			deadline = timeout_op(TMO),
+		})
+		assert_eq(which, 'deadline')
+		assert_timeout(ev, err)
+	end
+
+	rw:unwatch()
+
+	assert_eq(conn:stats().retained_watches, 0)
+	assert_eq(bus:stats().retained_watches, 0)
+
+	print('Retained watch (replay + live changes) test passed!')
+end
+
+local function test_retained_watch_no_replay()
+	local bus  = Bus.new({ m_wild = '#', s_wild = '+' })
+	local conn = bus:connect()
+
+	conn:retain({ 'watch', 'nr' }, 'OLD')
+
+	local rw = conn:watch_retained({ 'watch', 'nr' }, {
+		queue_len = 4,
+		full      = 'drop_oldest',
+		replay    = false,
+	})
+
+	do
+		local which, ev, err = select_named({
+			ev       = rw:recv_op(),
+			deadline = timeout_op(TMO),
+		})
+		assert_eq(which, 'deadline')
+		assert_timeout(ev, err)
+	end
+
+	conn:retain({ 'watch', 'nr' }, 'NEW')
+
+	do
+		local ev, err = fibers.perform(rw:recv_op())
+		assert(err == nil and ev, tostring(err))
+		assert_eq(ev.op, 'retain')
+		assert_eq(topic_str(ev.topic), 'watch/nr')
+		assert_eq(ev.payload, 'NEW')
+	end
+
+	rw:unwatch()
+
+	print('Retained watch (no replay) test passed!')
+end
+
+local function test_retained_watch_wildcards_and_literals()
+	local bus  = Bus.new({ m_wild = '#', s_wild = '+' })
+	local conn = bus:connect()
+
+	conn:retain({ 'metrics', '+' }, 'PLUS')
+	conn:retain({ 'metrics', 'abc' }, 'ABC')
+	conn:retain({ 'lit', '#', 'x' }, 'HASHMID')
+
+	local rw_wild = conn:watch_retained({ 'metrics', '+' }, {
+		queue_len = 10,
+		full      = 'drop_oldest',
+		replay    = true,
+	})
+	local rw_lit_plus = conn:watch_retained({ 'metrics', Bus.literal('+') }, {
+		queue_len = 10,
+		full      = 'drop_oldest',
+		replay    = true,
+	})
+	local rw_lit_hash_mid = conn:watch_retained({ 'lit', Bus.literal('#'), 'x' }, {
+		queue_len = 10,
+		full      = 'drop_oldest',
+		replay    = true,
+	})
+
+	do
+		local got = {}
+		for _ = 1, 2 do
+			local ev, err = fibers.perform(rw_wild:recv_op())
+			assert(err == nil and ev, tostring(err))
+			assert_eq(ev.op, 'retain')
+			got[ev.payload] = true
+		end
+		assert(got.PLUS and got.ABC, 'wild retained watch should replay PLUS and ABC')
+	end
+
+	do
+		local ev, err = fibers.perform(rw_lit_plus:recv_op())
+		assert(err == nil and ev, tostring(err))
+		assert_eq(ev.op, 'retain')
+		assert_eq(ev.payload, 'PLUS')
+		assert_eq(topic_str(ev.topic), 'metrics/+')
+	end
+
+	do
+		local which, ev, err = select_named({
+			ev       = rw_lit_plus:recv_op(),
+			deadline = timeout_op(TMO),
+		})
+		assert_eq(which, 'deadline')
+		assert_timeout(ev, err)
+	end
+
+	do
+		local ev, err = fibers.perform(rw_lit_hash_mid:recv_op())
+		assert(err == nil and ev, tostring(err))
+		assert_eq(ev.op, 'retain')
+		assert_eq(ev.payload, 'HASHMID')
+		assert_eq(topic_str(ev.topic), 'lit/#/x')
+	end
+
+	rw_wild:unwatch()
+	rw_lit_plus:unwatch()
+	rw_lit_hash_mid:unwatch()
+
+	print('Retained watch (wildcards + literal wrapper) test passed!')
+end
+
+local function test_retained_watch_unwatch_and_disconnect()
+	local bus  = Bus.new({ m_wild = '#', s_wild = '+' })
+	local conn = bus:connect()
+
+	local rw = conn:watch_retained({ 'watch', 'close' }, {
+		queue_len = 4,
+		full      = 'drop_oldest',
+	})
+
+	rw:unwatch()
+
+	do
+		local which, ev, err = select_named({
+			ev       = rw:recv_op(),
+			deadline = timeout_op(LONG_TMO),
+		})
+		assert_eq(which, 'ev')
+		assert(ev == nil)
+		assert_eq(err, 'unwatched')
+	end
+
+	local rw2 = conn:watch_retained({ 'watch', 'disconnect' }, {
+		queue_len = 4,
+		full      = 'drop_oldest',
+	})
+
+	conn:disconnect()
+
+	do
+		local which, ev, err = select_named({
+			ev       = rw2:recv_op(),
+			deadline = timeout_op(LONG_TMO),
+		})
+		assert_eq(which, 'ev')
+		assert(ev == nil)
+		assert_eq(err, 'disconnected')
+	end
+
+	print('Retained watch (unwatch + disconnect) test passed!')
+end
+
+local function test_retained_watch_bounded_queue()
+	local bus  = Bus.new({ m_wild = '#', s_wild = '+', q_length = 10 })
+	local conn = bus:connect()
+
+	local rw = conn:watch_retained({ 'watch', 'bounded' }, {
+		queue_len = 1,
+		full      = 'reject_newest',
+	})
+
+	conn:retain({ 'watch', 'bounded' }, 'one')
+	conn:retain({ 'watch', 'bounded' }, 'two')
+
+	do
+		local ev, err = fibers.perform(rw:recv_op())
+		assert(err == nil and ev, tostring(err))
+		assert_eq(ev.op, 'retain')
+		assert_eq(ev.payload, 'one')
+	end
+
+	do
+		local which, ev, err = select_named({
+			ev       = rw:recv_op(),
+			deadline = timeout_op(TMO),
+		})
+		assert_eq(which, 'deadline')
+		assert_timeout(ev, err)
+	end
+
+	assert_eq(rw:dropped(), 1)
+	assert_eq(conn:dropped(), 1)
+	assert_eq(bus:stats().dropped, 1)
+
+	rw:unwatch()
+
+	print('Retained watch (bounded queue) test passed!')
 end
 
 --------------------------------------------------------------------------------
@@ -716,7 +972,7 @@ local function test_laneB_call_success()
 	local reply, err = client:call({ 'rpc', 'echo' }, 'hi', { timeout = LONG_TMO })
 	assert(err == nil, tostring(err))
 	assert_eq(reply, 'reply:hi')
-	ep:unbind()     -- closes the endpoint mailbox; recv() returns nil; fibre exits
+	ep:unbind()
 
 	print('Lane B call (success) test passed!')
 end
@@ -914,6 +1170,12 @@ local function test_authz_denies_without_admin_role()
 	assert(not ok4, 'expected call_op perform without admin role to be denied')
 	assert(tostring(err4):match('permission denied'), tostring(err4))
 
+	local ok5, err5 = pcall(function()
+		conn_viewer:watch_retained({ 'authz', 'deny', 'watch' })
+	end)
+	assert(not ok5, 'expected watch_retained without admin role to be denied')
+	assert(tostring(err5):match('permission denied'), tostring(err5))
+
 	print('Authz deny test passed!')
 end
 
@@ -958,6 +1220,16 @@ local function test_authz_admin_allows_and_records_actions()
 		assert_eq(which, 'deadline')
 		assert_timeout(msg, err)
 	end
+
+	-- watch_retained
+	local rw = conn1:watch_retained({ 'authz', 'watch' }, { replay = true })
+	conn1:retain({ 'authz', 'watch' }, 'W')
+	do
+		local ev, err = fibers.perform(rw:recv_op())
+		assert(err == nil and ev and ev.op == 'retain')
+		assert_eq(ev.payload, 'W')
+	end
+	rw:unwatch()
 
 	-- bind + publish_one
 	local ep = conn1:bind({ 'authz', 'ep' }, { queue_len = 1 })
@@ -1013,14 +1285,15 @@ local function test_authz_admin_allows_and_records_actions()
 		actions[ctx.action] = true
 	end
 
-	assert(actions.subscribe,   'expected subscribe action to be authorised')
-	assert(actions.publish,     'expected publish action to be authorised')
-	assert(actions.retain,      'expected retain action to be authorised')
-	assert(actions.unretain,    'expected unretain action to be authorised')
-	assert(actions.bind,        'expected bind action to be authorised')
-	assert(actions.publish_one, 'expected publish_one action to be authorised')
-	assert(actions.request,     'expected request action to be authorised')
-	assert(actions.call,        'expected call action to be authorised')
+	assert(actions.subscribe,      'expected subscribe action to be authorised')
+	assert(actions.publish,        'expected publish action to be authorised')
+	assert(actions.retain,         'expected retain action to be authorised')
+	assert(actions.unretain,       'expected unretain action to be authorised')
+	assert(actions.watch_retained, 'expected watch_retained action to be authorised')
+	assert(actions.bind,           'expected bind action to be authorised')
+	assert(actions.publish_one,    'expected publish_one action to be authorised')
+	assert(actions.request,        'expected request action to be authorised')
+	assert(actions.call,           'expected call action to be authorised')
 
 	print('Authz admin allow/record test passed!')
 end
@@ -1040,6 +1313,12 @@ fibers.run(function ()
 
 	test_retained_msg_basic()
 	test_retained_query_wildcards_and_unretain()
+
+	test_retained_watch_replay_and_live_changes()
+	test_retained_watch_no_replay()
+	test_retained_watch_wildcards_and_literals()
+	test_retained_watch_unwatch_and_disconnect()
+	test_retained_watch_bounded_queue()
 
 	test_q_overflow_drop_oldest_default()
 	test_q_overflow_reject_newest_override()
