@@ -1,324 +1,1236 @@
---- A pubsub message bus built with fibers and a Trie for topic matching.
--- This module provides a concurrent pubsub system that supports wildcard subscriptions,
--- retained messages, and a request/response model.
--- @module bus
+-- bus.lua
+--
+-- In-process pub/sub bus built on fibers + trie.
+--  - wildcard subscriptions (pubsub trie: wildcards allowed in stored keys; literal queries)
+--  - retained messages (retained trie: literal stored keys; wildcards allowed in queries)
+--  - request/response helpers (reply_to topic)
+--
+-- Optional extensions:
+--  - lane B: bind/publish_one/call_op for admission-signalled point-to-point delivery
+--  - authz : principal-aware authorisation hooks on connection actions
+---@module 'bus'
 
-local queue = require 'fibers.queue'
-local op = require 'fibers.op'
-local sleep = require 'fibers.sleep'
+local mailbox   = require 'fibers.mailbox'
+local op        = require 'fibers.op'
+local performer = require 'fibers.performer'
+local scope_mod = require 'fibers.scope'
+local runtime   = require 'fibers.runtime'
+local wait      = require 'fibers.wait'
+
 local trie = require 'trie'
 local uuid = require 'uuid'
+
+local perform = performer.perform
+
+---@alias Topic any[]
+---@alias FullPolicy '"drop_oldest"'|'"reject_newest"'
+
+local DEFAULT_Q_LEN  = 10
+local DEFAULT_POLICY = 'drop_oldest'
+
+--------------------------------------------------------------------------------
+-- trie literal helper (escape hatch)
+--------------------------------------------------------------------------------
+
+-- Latest trie supports trie.literal(v) to force literal matching even when v equals
+-- the wildcard symbols (e.g. "+" or "#"). To interoperate cleanly, the bus must:
+--   * allow literal tokens in topics, and
+--   * treat literal tokens as concrete (non-wild) for "concrete topic" checks.
+local LIT_MT = getmetatable(trie.literal('x'))
+
+---@param tok any
+---@return boolean
+local function is_lit(tok)
+	return type(tok) == 'table' and getmetatable(tok) == LIT_MT
+end
+
+---@param tok any
+---@return any v
+---@return boolean was_lit
+local function unwrap_token(tok)
+	if is_lit(tok) then
+		return tok.v, true
+	end
+	return tok, false
+end
+
+--------------------------------------------------------------------------------
+-- Validation / helpers
+--------------------------------------------------------------------------------
+
+---@param p any
+---@param level? integer
+---@return FullPolicy|nil
+local function assert_full_policy(p, level)
+	level = (level or 1) + 1
+	if p == nil then return nil end
+
+	if p == 'drop_newest' then
+		error('mailbox full policy "drop_newest" is deprecated; use "reject_newest"', level)
+	end
+
+	if p == 'drop_oldest' or p == 'reject_newest' then
+		return p
+	end
+
+	if p == 'block' then
+		error('bus delivery must be bounded; mailbox full policy "block" is not supported', level)
+	end
+
+	error('invalid mailbox full policy: ' .. tostring(p), level)
+end
+
+--- Dense array validation (mirrors trie.lua behaviour).
+---@param t any
+---@param errlvl integer
+---@return integer n
+local function array_len(t, errlvl)
+	if type(t) ~= 'table' then
+		error('tokens must be a table (dense array)', errlvl)
+	end
+
+	local n = 0
+	for _ in ipairs(t) do n = n + 1 end
+
+	for k in pairs(t) do
+		if type(k) ~= 'number' or k < 1 or k % 1 ~= 0 or k > n then
+			error('token arrays must use 1..n integer keys only', errlvl)
+		end
+	end
+
+	return n
+end
+
+--- Topic validation: array elements must be strings/numbers or trie.literal(v).
+---@param topic any
+---@param what string
+---@param level? integer
+---@return Topic
+local function assert_topic(topic, what, level)
+	level = (level or 1) + 1
+	local n = array_len(topic, level)
+
+	for i = 1, n do
+		local v = topic[i]
+		local uv = unwrap_token(v)
+		local tv = type(uv)
+		if tv ~= 'string' and tv ~= 'number' then
+			error(('%s[%d] must be a string or number (got %s)'):format(what, i, tv), level)
+		end
+	end
+
+	return topic
+end
+
+---@param s_wild string|number
+---@param m_wild string|number
+---@param topic Topic
+---@param what string
+---@param level? integer
+local function assert_concrete_topic(s_wild, m_wild, topic, what, level)
+	level = (level or 1) + 1
+	local n = array_len(topic, level)
+	for i = 1, n do
+		local raw, was_lit = unwrap_token(topic[i])
+		if not was_lit and (raw == s_wild or raw == m_wild) then
+			error(('%s must be a concrete topic (no wildcards)'):format(what), level)
+		end
+	end
+end
+
+--- Stable key for a concrete topic (within a single process).
+---@param topic Topic
+---@return string
+local function topic_key(topic)
+	local n = array_len(topic, 3)
+	local parts = {}
+	for i = 1, n do
+		local raw = unwrap_token(topic[i])
+		if type(raw) == 'string' then
+			parts[#parts + 1] = 's' .. #raw .. ':' .. raw
+		else
+			local s = tostring(raw)
+			parts[#parts + 1] = 'n' .. #s .. ':' .. s
+		end
+	end
+	return table.concat(parts, '|')
+end
+
+---@param topic Topic
+---@return string
+local function topic_debug(topic)
+	local n = array_len(topic, 3)
+	local parts = {}
+	for i = 1, n do
+		local raw, was_lit = unwrap_token(topic[i])
+		parts[i] = was_lit and ('=' .. tostring(raw)) or tostring(raw)
+	end
+	return table.concat(parts, '/')
+end
+
+--------------------------------------------------------------------------------
+-- Authorisation
+--------------------------------------------------------------------------------
+
+--- Resolve an authoriser callable from:
+---   * function(ctx) -> boolean|nil, reason?
+---   * table:allow(ctx) -> boolean|nil, reason?
+---   * table:authorize(ctx) -> boolean|nil, reason?
+---@param auth any
+---@return function|nil
+local function authoriser_callable(auth)
+	if auth == nil then return nil end
+	if type(auth) == 'function' then
+		return function(ctx)
+			return auth(ctx)
+		end
+	end
+	if type(auth) == 'table' then
+		if type(auth.allow) == 'function' then
+			return function(ctx)
+				return auth:allow(ctx)
+			end
+		end
+		if type(auth.authorize) == 'function' then
+			return function(ctx)
+				return auth:authorize(ctx)
+			end
+		end
+	end
+	return nil
+end
+
+---@param bus Bus
+---@param principal any
+---@param action string
+---@param topic Topic
+---@param extra? table
+---@param level? integer
+---@return boolean ok
+---@return any reason
+local function authorize_action(bus, principal, action, topic, extra, level)
+	level = (level or 1) + 1
+
+	local auth = bus and bus._authoriser or nil
+	if auth == nil then
+		return true, nil
+	end
+
+	local fn = authoriser_callable(auth)
+	if not fn then
+		error('bus authoriser must be a function or table with :allow(ctx) / :authorize(ctx)', level)
+	end
+
+	local ok, reason = fn({
+		bus       = bus,
+		principal = principal,
+		action    = action,
+		topic     = topic,
+		extra     = extra,
+	})
+
+	if ok == false or ok == nil then
+		return false, reason or 'forbidden'
+	end
+	return true, nil
+end
+
+---@param self Connection
+---@param action string
+---@param topic Topic
+---@param extra? table
+---@param level? integer
+local function assert_authorized(self, action, topic, extra, level)
+	level = (level or 1) + 1
+	local ok, reason = authorize_action(self._bus, self._principal, action, topic, extra, level)
+	if not ok then
+		error(
+			('permission denied for %s on %s: %s'):format(
+				tostring(action),
+				topic_debug(topic),
+				tostring(reason or 'forbidden')
+			),
+			level
+		)
+	end
+end
 
 --------------------------------------------------------------------------------
 -- Message
 --------------------------------------------------------------------------------
 
---- Message class.
--- Represents a message that can be published on the bus.
+---@class Message
+---@field topic Topic
+---@field payload any
+---@field reply_to Topic|nil
+---@field id any|nil
 local Message = {}
 Message.__index = Message
 
---- Creates a new Message.
--- @tparam any topic The topic of the message.
--- @tparam any payload The payload of the message.
--- @tparam[opt] table opts Options table.
--- @tparam[opt] boolean opts.retained Whether the message should be retained.
--- @tparam[opt] any opts.reply_to The reply-to topic.
--- @tparam[opt] table opts.headers Headers to attach to the message.
--- @tparam[opt] any opts.id The message ID; if not provided, a new UUID is generated.
--- @treturn Message The new message.
-local function new_msg(topic, payload, opts)
-    opts = opts or {}
-    return setmetatable({
-        topic    = topic,
-        payload  = payload,
-        retained  = opts.retained,
-        reply_to  = opts.reply_to,
-        headers   = opts.headers or {},
-        id        = opts.id or uuid.new(),
-    }, Message)
+---@param topic Topic
+---@param payload any
+---@param reply_to? Topic
+---@param id? any
+---@return Message
+local function new_msg(topic, payload, reply_to, id)
+	return setmetatable({
+		topic    = topic,
+		payload  = payload,
+		reply_to = reply_to,
+		id       = id,
+	}, Message)
 end
 
 --------------------------------------------------------------------------------
--- Subscription
+-- Subscription (lane A)
 --------------------------------------------------------------------------------
 
---- Subscription class.
--- Represents a subscription to a topic on the bus.
+---@class Subscription
+---@field _conn Connection|nil
+---@field _topic Topic
+---@field _tx MailboxTx
+---@field _rx MailboxRx
+---@field _detach_finaliser (fun())|nil
 local Subscription = {}
 Subscription.__index = Subscription
 
---- Creates a new subscription.
--- @tparam Connection conn The connection that owns the subscription.
--- @tparam any topic The topic subscribed to.
--- @tparam queue q The queue for incoming messages.
--- @treturn Subscription The new subscription.
-local function new_subscription(conn, topic, q)
-    return setmetatable({
-        connection = conn,
-        topic = topic,
-        q = q
-    }, Subscription)
+local function new_subscription(conn, topic, tx, rx)
+	return setmetatable({
+		_conn             = conn,
+		_topic            = topic,
+		_tx               = tx,
+		_rx               = rx,
+		_detach_finaliser = nil,
+	}, Subscription)
 end
 
---- Waits for the next message or a timeout.
--- Uses op.choice to combine a get operation on the queue and a sleep op.
--- @tparam[opt] number timeout The maximum time to wait, in seconds.
--- @treturn op The operation representing the next message retrieval.
-function Subscription:next_msg_op(timeout)
-    local msg_op = op.choice(
-        self.q:get_op(),
-        timeout and sleep.sleep_op(timeout):wrap(function()
-            return nil, "Timeout"
-        end)
-    )
-    return msg_op
+function Subscription:topic() return self._topic end
+
+function Subscription:why() return self._rx:why() end
+
+function Subscription:dropped()
+	local tx = self._tx
+	return (tx and tx.dropped and tx:dropped()) or 0
 end
 
---- Retrieves the next message, blocking until available or timeout.
--- @tparam[opt] number timeout The maximum time to wait, in seconds.
--- @treturn any The next message.
--- @treturn nil|string nil, or an error message on timeout.
-function Subscription:next_msg(timeout)
-    return self:next_msg_op(timeout):perform()
+---@param reason any
+function Subscription:_close(reason)
+	if self._tx then self._tx:close(reason) end
 end
 
---- Waits for the next message or context cancellation.
--- Combines the queue get op with a context's done op.
--- @tparam any ctx The context object.
--- @treturn op The operation representing the next message retrieval.
-function Subscription:next_msg_with_context_op(ctx)
-    local msg_op = op.choice(
-        self.q:get_op(),
-        ctx:done_op():wrap(function()
-            return nil, ctx:err()
-        end)
-    )
-    return msg_op
-end
-
---- Retrieves the next message with context support, blocking until available or cancelled.
--- @tparam any context The context object.
--- @treturn any The next message.
--- @treturn nil|string nil, or an error message if cancelled.
-function Subscription:next_msg_with_context(context)
-    return self:next_msg_with_context_op(context):perform()
-end
-
---- Unsubscribes from the topic.
--- Calls the unsubscribe method on the connection.
 function Subscription:unsubscribe()
-    self.connection:unsubscribe(self.topic, self)
+	local conn = self._conn
+	if not conn then
+		self:_close('unsubscribed')
+		return true
+	end
+	return conn:unsubscribe(self)
+end
+
+--- recv_op: when performed -> Message|nil, err|string|nil
+---@return Op
+function Subscription:recv_op()
+	return self._rx:recv_op():wrap(function (msg)
+		if msg == nil then
+			return nil, tostring(self._rx:why() or 'closed')
+		end
+		return msg, nil
+	end)
+end
+
+function Subscription:recv()
+	return perform(self:recv_op())
+end
+
+function Subscription:iter()
+	-- Iterator yields Message values until nil.
+	return self._rx:iter()
+end
+
+function Subscription:payloads()
+	local it = self._rx:iter()
+	return function ()
+		local msg = it()
+		return msg and msg.payload or nil
+	end
+end
+
+function Subscription:stats()
+	return { dropped = self:dropped(), topic = self._topic }
 end
 
 --------------------------------------------------------------------------------
--- Connection
+-- Endpoint (lane B)
 --------------------------------------------------------------------------------
 
---- Connection class.
--- Represents a connection to the bus, encapsulating subscriptions and publish/subscribe methods.
-local Connection = {}
-Connection.__index = Connection
+---@class Endpoint
+---@field _conn Connection|nil
+---@field _topic Topic
+---@field _key string
+---@field _tx MailboxTx
+---@field _rx MailboxRx
+---@field _detach_finaliser (fun())|nil
+local Endpoint = {}
+Endpoint.__index = Endpoint
 
---- Creates a new connection for the bus.
--- @tparam Bus bus The bus to connect to.
--- @treturn Connection The new connection.
-local function new_connection(bus)
-    return setmetatable({
-        bus = bus,
-        subscriptions = {}
-    }, Connection)
+local function new_endpoint(conn, topic, key, tx, rx)
+	return setmetatable({
+		_conn             = conn,
+		_topic            = topic,
+		_key              = key,
+		_tx               = tx,
+		_rx               = rx,
+		_detach_finaliser = nil,
+	}, Endpoint)
 end
 
---- Publishes a message on the bus.
--- @tparam Message msg The message to publish.
--- @treturn boolean true on success.
-function Connection:publish(msg)
-    assert(getmetatable(msg)==Message, "Only message types can be published")
-    self.bus:publish(msg)
-    return true
+function Endpoint:topic() return self._topic end
+
+function Endpoint:why() return self._rx:why() end
+
+function Endpoint:dropped()
+	local tx = self._tx
+	return (tx and tx.dropped and tx:dropped()) or 0
 end
 
---- Publishes multiple messages derived from a nested payload.
--- Iterates over the nested_payload table to publish messages for each key/value pair.
--- @tparam any root_topic The base topic as an array of tokens.
--- @tparam table nested_payload A nested table of payloads.
--- @tparam[opt] table opts Options to pass to new_msg.
--- @treturn boolean true on success.
-function Connection:publish_multiple(root_topic, nested_payload, opts)
-    opts = opts or {}
-    local stack = {{prefix = root_topic, payload = nested_payload}}
-
-    while #stack > 0 do
-        local current = table.remove(stack)
-        local prefix = current.prefix
-        local payload = current.payload
-
-        for key, value in pairs(payload) do
-            local new_topic = {}
-            for i, token in ipairs(prefix) do
-                new_topic[i] = token
-            end
-            table.insert(new_topic, key)
-
-            if type(value) == "table" then
-                table.insert(stack, {prefix = new_topic, payload = value})
-            else
-                local msg = new_msg(new_topic, value, opts)
-                self:publish(msg)
-            end
-        end
-    end
-
-    return true
+function Endpoint:unbind()
+	local conn = self._conn
+	if not conn then
+		if self._tx then self._tx:close('unbound') end
+		return true
+	end
+	return conn:unbind(self)
 end
 
---- Subscribes to a topic.
--- @tparam any topic The topic to subscribe to.
--- @treturn Subscription The subscription object.
--- @treturn nil|string nil, or an error message on failure.
-function Connection:subscribe(topic)
-    local subscription, err = self.bus:subscribe(self, topic)
-    if err then
-        return nil, err
-    end
-    table.insert(self.subscriptions, subscription)
-    return subscription, nil
+---@return Op
+function Endpoint:recv_op()
+	return self._rx:recv_op():wrap(function (msg)
+		if msg == nil then
+			return nil, tostring(self._rx:why() or 'closed')
+		end
+		return msg, nil
+	end)
 end
 
---- Unsubscribes from a topic.
--- Removes the subscription from the connection and notifies the bus.
--- @tparam any topic The topic to unsubscribe from.
--- @tparam Subscription subscription The subscription to remove.
-function Connection:unsubscribe(topic, subscription)
-    self.bus:unsubscribe(topic, subscription)
-    for i, sub in ipairs(self.subscriptions) do
-        if sub == subscription then
-            table.remove(self.subscriptions, i)
-            return
-        end
-    end
+function Endpoint:recv()
+	return perform(self:recv_op())
 end
 
---- Disconnects the connection.
--- Unsubscribes from all topics and clears subscriptions.
-function Connection:disconnect()
-    for _, subscription in ipairs(self.subscriptions) do
-        self:unsubscribe(subscription.topic, subscription)
-    end
-    self.subscriptions = {}
+function Endpoint:iter()
+	return self._rx:iter()
 end
 
---- Sends a request message and subscribes to the reply.
--- @tparam Message msg The request message.
--- @treturn Subscription The subscription for the reply.
-function Connection:request(msg)
-    msg.reply_to = msg.reply_to or uuid.new()
-    self:publish(msg)
-    return self:subscribe({ msg.reply_to })
+function Endpoint:payloads()
+	local it = self._rx:iter()
+	return function ()
+		local msg = it()
+		return msg and msg.payload or nil
+	end
 end
 
 --------------------------------------------------------------------------------
 -- Bus
 --------------------------------------------------------------------------------
 
---- Bus class.
--- Manages topics, subscriptions, and message publishing.
+---@class Bus
+---@field _q_length integer
+---@field _full FullPolicy
+---@field _topics any
+---@field _retained any
+---@field _conns table<Connection, boolean>
+---@field _s_wild string|number
+---@field _m_wild string|number
+---@field _endpoints table<string, Endpoint>
+---@field _authoriser any|nil
 local Bus = {}
 Bus.__index = Bus
 
-local DEFAULT_Q_LEN = 10
-
---- Creates a new connection to the bus.
--- @treturn Connection A new connection instance.
-function Bus:connect()
-    return new_connection(self)
+--- Best-effort delivery:
+--- - never raises for congestion/closure
+--- - avoids raising scope cancellation/failure by using scope:try when running
+---@param tx MailboxTx
+---@param msg Message
+local function deliver_best_effort(tx, msg)
+	local s = scope_mod.current()
+	if s and s.try and s.status then
+		local st = select(1, s:status())
+		if st == 'running' then
+			s:try(tx:send_op(msg))
+			return
+		end
+	end
+	-- Fallback: raw perform. With non-blocking policies, this remains bounded.
+	op.perform_raw(tx:send_op(msg))
 end
 
---- Subscribes a connection to a topic.
--- If the topic doesn't exist in the Trie, it is created.
--- Retained messages matching the topic are immediately delivered.
--- @tparam Connection connection The connection subscribing.
--- @tparam any topic The topic to subscribe to.
--- @treturn Subscription The subscription object.
-function Bus:subscribe(connection, topic)
-    local topic_entry = self.topics:retrieve(topic)
-    if not topic_entry then
-        topic_entry = { subs = {} }
-        self.topics:insert(topic, topic_entry)
-    end
+---@param conn Connection
+---@param topic Topic
+---@param qlen integer
+---@param full FullPolicy
+---@return Subscription
+function Bus:_subscribe(conn, topic, qlen, full)
+	local subs = self._topics:retrieve(topic)
+	if not subs then
+		subs = {}
+		self._topics:insert(topic, subs)
+	end
 
-    local q = queue.new(self.q_length)
-    local subscription = new_subscription(connection, topic, q)
-    table.insert(topic_entry.subs, subscription)
+	local tx, rx = mailbox.new(qlen, { full = full })
+	local sub    = new_subscription(conn, topic, tx, rx)
+	subs[sub]    = true
 
-    -- Deliver retained messages.
-    for retained_msg in self.retained_messages:match_values_iter(topic) do
-        q:put_op(retained_msg):perform_alt(function() end)
-    end
+	-- Retained replay is best-effort and bounded.
+	self._retained:each(topic, function (_k, retained_msg)
+		deliver_best_effort(tx, retained_msg)
+	end)
 
-    return subscription
+	return sub
 end
 
---- Publishes a message to all subscribers matching the topic.
--- Also handles retained messages if the message is marked as retained.
--- @tparam Message msg The message to publish.
-function Bus:publish(msg)
-    for topic_entry in self.topics:match_values_iter(msg.topic) do
-        for _, sub in ipairs(topic_entry.subs) do
-            sub.q:put_op(msg):perform_alt(function() end)
-        end
-    end
-
-    if msg.retained then
-        if not msg.payload then
-            -- Clearing retained message.
-            self.retained_messages:delete(msg.topic)
-        else
-            self.retained_messages:insert(msg.topic, msg)
-        end
-    end
+function Bus:_unsubscribe(sub)
+	local subs = self._topics:retrieve(sub._topic)
+	if not subs then return end
+	subs[sub] = nil
+	if next(subs) == nil then
+		self._topics:delete(sub._topic)
+	end
 end
 
---- Unsubscribes a subscription from a topic.
--- If a topic has no more subscribers, it is removed from the Trie.
--- @tparam any topic The topic to unsubscribe from.
--- @tparam Subscription subscription The subscription to remove.
-function Bus:unsubscribe(topic, subscription)
-    local topic_entry = self.topics:retrieve(topic)
-    if not topic_entry then
-        error("Unsubscribe from non-existent topic")
-    end
-
-    for i, sub in ipairs(topic_entry.subs) do
-        if sub == subscription then
-            table.remove(topic_entry.subs, i)
-            break
-        end
-    end
-
-    if #topic_entry.subs == 0 then
-        self.topics:delete(topic)
-    end
+function Bus:_publish(msg)
+	self._topics:each(msg.topic, function (_k, subs)
+		for sub in pairs(subs) do
+			if sub and sub._tx then
+				deliver_best_effort(sub._tx, msg)
+			end
+		end
+	end)
 end
 
---- Creates a new Bus instance.
--- @tparam[opt] table params A table of parameters.
--- @tparam[opt] number params.q_length The maximum length of subscription queues.
--- @tparam[opt] any params.s_wild The token for a single-level wildcard (default: "+").
--- @tparam[opt] any params.m_wild The token for a multi-level wildcard (default: "#").
--- @treturn Bus The new Bus instance.
+function Bus:_retain(msg)
+	self:_publish(msg)
+	self._retained:insert(msg.topic, msg)
+end
+
+function Bus:_unretain(topic)
+	self._retained:delete(topic)
+end
+
+--------------------------------------------------------------------------------
+-- Connection
+--------------------------------------------------------------------------------
+
+---@class Connection
+---@field _bus Bus|nil
+---@field _principal any|nil
+---@field _q_length integer
+---@field _full FullPolicy
+---@field _subs table<Subscription, boolean>
+---@field _eps table<Endpoint, boolean>
+---@field _disconnected boolean
+local Connection = {}
+Connection.__index = Connection
+
+local function assert_connected(self, level)
+	if self._disconnected or not self._bus then
+		error('connection is disconnected', (level or 1) + 1)
+	end
+end
+
+local function new_connection(bus, principal, q_length, full)
+	return setmetatable({
+		_bus          = bus,
+		_principal    = principal,
+		_q_length     = q_length,
+		_full         = full,
+		_subs         = {},
+		_eps          = {},
+		_disconnected = false,
+	}, Connection)
+end
+
+function Connection:is_disconnected()
+	return self._disconnected
+end
+
+function Connection:principal()
+	return self._principal
+end
+
+function Connection:dropped()
+	local n = 0
+	for sub in pairs(self._subs) do
+		n = n + (sub:dropped() or 0)
+	end
+	for ep in pairs(self._eps) do
+		n = n + (ep:dropped() or 0)
+	end
+	return n
+end
+
+--- publish(topic, payload[, opts])
+--- opts: { reply_to?: Topic, id?: any }
+function Connection:publish(topic, payload, opts)
+	assert_connected(self, 1)
+	assert_topic(topic, 'topic', 1)
+
+	opts = opts or {}
+	local reply_to = opts.reply_to
+	if reply_to ~= nil then
+		assert_topic(reply_to, 'reply_to', 2)
+	end
+
+	assert_authorized(self, 'publish', topic, {
+		payload  = payload,
+		reply_to = reply_to,
+		id       = opts.id,
+	}, 1)
+
+	self._bus:_publish(new_msg(topic, payload, reply_to, opts.id))
+	return true
+end
+
+function Connection:retain(topic, payload, opts)
+	assert_connected(self, 1)
+	assert_topic(topic, 'topic', 1)
+
+	opts = opts or {}
+	local reply_to = opts.reply_to
+	if reply_to ~= nil then
+		assert_topic(reply_to, 'reply_to', 2)
+	end
+
+	assert_authorized(self, 'retain', topic, {
+		payload  = payload,
+		reply_to = reply_to,
+		id       = opts.id,
+	}, 1)
+
+	self._bus:_retain(new_msg(topic, payload, reply_to, opts.id))
+	return true
+end
+
+function Connection:unretain(topic)
+	assert_connected(self, 1)
+	assert_topic(topic, 'topic', 1)
+
+	assert_authorized(self, 'unretain', topic, nil, 1)
+
+	self._bus:_unretain(topic)
+	return true
+end
+
+--- Internal subscribe helper with no authz check.
+--- opts: { queue_len?: integer, full?: FullPolicy }
+---@param topic Topic
+---@param opts? table
+---@return Subscription
+function Connection:_subscribe_internal(topic, opts)
+	assert_connected(self, 1)
+
+	opts = opts or {}
+	if type(opts) ~= 'table' then
+		error('_subscribe_internal: opts must be a table (or nil)', 2)
+	end
+
+	local qlen = opts.queue_len
+	if qlen == nil then qlen = self._q_length end
+	if type(qlen) ~= 'number' or qlen < 0 then
+		error('_subscribe_internal: queue_len must be >= 0', 2)
+	end
+
+	local fullp = assert_full_policy(opts.full or self._full, 2) or DEFAULT_POLICY
+
+	local sub = self._bus:_subscribe(self, topic, qlen, fullp)
+	self._subs[sub] = true
+
+	local s = scope_mod.current()
+	sub._detach_finaliser = s:finally(function () sub:unsubscribe() end)
+
+	return sub
+end
+
+--- subscribe(topic[, opts]) -> Subscription
+--- opts: { queue_len?: integer, full?: FullPolicy }
+function Connection:subscribe(topic, opts)
+	assert_connected(self, 1)
+	assert_topic(topic, 'topic', 1)
+
+	assert_authorized(self, 'subscribe', topic, {
+		opts = opts,
+	}, 1)
+
+	return self:_subscribe_internal(topic, opts)
+end
+
+function Connection:unsubscribe(sub)
+	if not sub or getmetatable(sub) ~= Subscription then
+		error('unsubscribe expects a Subscription', 2)
+	end
+
+	local owned = not not self._subs[sub]
+
+	sub:_close('unsubscribed')
+
+	if sub._detach_finaliser then
+		sub._detach_finaliser()
+		sub._detach_finaliser = nil
+	end
+
+	if owned then
+		self._subs[sub] = nil
+		self._bus:_unsubscribe(sub)
+	end
+	if sub._conn == self then sub._conn = nil end
+	return true
+end
+
+function Connection:disconnect()
+	if self._disconnected then return true end
+	self._disconnected = true
+
+	local bus = self._bus
+	self._bus = nil
+
+	-- Snapshot to avoid mutation during pairs().
+	local subs = {}
+	for sub in pairs(self._subs) do subs[#subs + 1] = sub end
+	for i = 1, #subs do
+		local sub = subs[i]
+		if sub then
+			sub:_close('disconnected')
+			if sub._detach_finaliser then
+				sub._detach_finaliser()
+				sub._detach_finaliser = nil
+			end
+			if bus then bus:_unsubscribe(sub) end
+			self._subs[sub] = nil
+			if sub._conn == self then sub._conn = nil end
+		end
+	end
+
+	local eps = {}
+	for ep in pairs(self._eps) do eps[#eps + 1] = ep end
+	for i = 1, #eps do
+		local ep = eps[i]
+		if ep then
+			if ep._tx then ep._tx:close('disconnected') end
+			if bus and bus._endpoints and bus._endpoints[ep._key] == ep then
+				bus._endpoints[ep._key] = nil
+			end
+			if ep._detach_finaliser then
+				ep._detach_finaliser()
+				ep._detach_finaliser = nil
+			end
+			self._eps[ep] = nil
+			if ep._conn == self then ep._conn = nil end
+		end
+	end
+
+	if bus and bus._conns then bus._conns[self] = nil end
+	return true
+end
+
+function Connection:stats()
+	local nsubs, neps = 0, 0
+	for _ in pairs(self._subs) do nsubs = nsubs + 1 end
+	for _ in pairs(self._eps) do neps = neps + 1 end
+	return { dropped = self:dropped(), subscriptions = nsubs, endpoints = neps }
+end
+
+--------------------------------------------------------------------------------
+-- Request helpers (lane A)
+--------------------------------------------------------------------------------
+
+--- request_sub(topic, payload[, opts]) -> Subscription
+--- opts: { queue_len?: integer, full?: FullPolicy }
+function Connection:request_sub(topic, payload, opts)
+	assert_connected(self, 1)
+	assert_topic(topic, 'topic', 1)
+
+	opts = opts or {}
+	if type(opts) ~= 'table' then
+		error('request_sub: opts must be a table (or nil)', 2)
+	end
+
+	assert_authorized(self, 'request', topic, {
+		payload = payload,
+		opts    = opts,
+	}, 1)
+
+	local reply_to = { uuid.new() }
+	local msg      = new_msg(topic, payload, reply_to)
+
+	-- Subscribe first to avoid racing a fast responder.
+	local sub = self:_subscribe_internal(reply_to, opts)
+	self._bus:_publish(msg)
+	return sub
+end
+
+--- request_once_op(topic, payload[, opts]) -> Op
+--- opts: { timeout?: number } is intentionally not built-in; caller composes.
+function Connection:request_once_op(topic, payload, opts)
+	opts = opts or {}
+	if type(opts) ~= 'table' then
+		error('request_once_op: opts must be a table (or nil)', 2)
+	end
+
+	return op.guard(function ()
+		assert_connected(self, 1)
+		assert_topic(topic, 'topic', 1)
+
+		assert_authorized(self, 'request', topic, {
+			payload = payload,
+			opts    = opts,
+		}, 1)
+
+		local reply_to = { uuid.new() }
+		local msg      = new_msg(topic, payload, reply_to)
+
+		return op.bracket(
+			function ()
+				-- Keep the first reply; reject duplicates.
+				return self:_subscribe_internal(reply_to, { queue_len = 1, full = 'reject_newest' })
+			end,
+			function (sub) sub:unsubscribe() end,
+			function (sub)
+				self._bus:_publish(msg)
+				return sub:recv_op()
+			end
+		)
+	end)
+end
+
+--------------------------------------------------------------------------------
+-- Lane B: endpoints + publish_one + call_op (opt-in)
+--------------------------------------------------------------------------------
+
+--- Internal bind helper with no authz check.
+--- opts: { queue_len?: integer }  (full policy is fixed to reject_newest)
+---@param topic Topic
+---@param opts? table
+---@return Endpoint
+function Connection:_bind_internal(topic, opts)
+	assert_connected(self, 1)
+
+	opts = opts or {}
+	if type(opts) ~= 'table' then
+		error('_bind_internal: opts must be a table (or nil)', 2)
+	end
+
+	local bus = assert(self._bus)
+	assert_concrete_topic(bus._s_wild, bus._m_wild, topic, 'bind topic', 2)
+
+	local qlen = opts.queue_len
+	if qlen == nil then qlen = 1 end
+	if type(qlen) ~= 'number' or qlen < 0 then
+		error('_bind_internal: queue_len must be >= 0', 2)
+	end
+
+	local key = topic_key(topic)
+	if bus._endpoints[key] ~= nil then
+		error('bind: topic is already bound', 2)
+	end
+
+	-- Endpoint mailboxes use reject_newest for explicit admission signalling.
+	local tx, rx = mailbox.new(qlen, { full = 'reject_newest' })
+	local ep     = new_endpoint(self, topic, key, tx, rx)
+
+	bus._endpoints[key] = ep
+	self._eps[ep] = true
+
+	local s = scope_mod.current()
+	ep._detach_finaliser = s:finally(function () ep:unbind() end)
+
+	return ep
+end
+
+--- bind(topic[, opts]) -> Endpoint
+--- opts: { queue_len?: integer }  (full policy is fixed to reject_newest)
+function Connection:bind(topic, opts)
+	assert_connected(self, 1)
+	assert_topic(topic, 'topic', 1)
+
+	assert_authorized(self, 'bind', topic, {
+		opts = opts,
+	}, 1)
+
+	return self:_bind_internal(topic, opts)
+end
+
+function Connection:unbind(ep)
+	if not ep or getmetatable(ep) ~= Endpoint then
+		error('unbind expects an Endpoint', 2)
+	end
+	local bus = self._bus
+
+	if ep._tx then ep._tx:close('unbound') end
+
+	if ep._detach_finaliser then
+		ep._detach_finaliser()
+		ep._detach_finaliser = nil
+	end
+
+	if self._eps[ep] then
+		self._eps[ep] = nil
+		if bus and bus._endpoints and bus._endpoints[ep._key] == ep then
+			bus._endpoints[ep._key] = nil
+		end
+	end
+
+	if ep._conn == self then ep._conn = nil end
+	return true
+end
+
+--- publish_one_op(topic, payload[, opts]) -> Op
+--- opts: { reply_to?: Topic, id?: any }
+--- when performed -> ok:boolean, reason:any|nil
+function Connection:publish_one_op(topic, payload, opts)
+	opts = opts or {}
+	if type(opts) ~= 'table' then
+		error('publish_one_op: opts must be a table (or nil)', 2)
+	end
+
+	return op.guard(function ()
+		assert_connected(self, 1)
+		assert_topic(topic, 'topic', 1)
+
+		assert_authorized(self, 'publish_one', topic, {
+			payload  = payload,
+			reply_to = opts.reply_to,
+			id       = opts.id,
+		}, 1)
+
+		local bus = assert(self._bus)
+		assert_concrete_topic(bus._s_wild, bus._m_wild, topic, 'publish_one topic', 2)
+
+		local reply_to = opts.reply_to
+		if reply_to ~= nil then
+			assert_topic(reply_to, 'reply_to', 2)
+			assert_concrete_topic(bus._s_wild, bus._m_wild, reply_to, 'reply_to', 2)
+		end
+
+		local key = topic_key(topic)
+		local ep  = bus._endpoints[key]
+		if not ep or not ep._tx then
+			return op.always(false, 'no_route')
+		end
+
+		local msg = new_msg(topic, payload, reply_to, opts.id)
+
+		-- Leaf op: do not perform inside guard.
+		return ep._tx:send_op(msg):wrap(function (ok, reason)
+			-- mailbox send semantics:
+			--   true            accepted
+			--   false, "full"   rejected
+			--   nil             closed
+			if ok == true then return true, nil end
+			if ok == nil then return false, 'closed' end
+			return false, reason or 'full'
+		end)
+	end)
+end
+
+function Connection:publish_one(topic, payload, opts)
+	return perform(self:publish_one_op(topic, payload, opts))
+end
+
+--- call_op(topic, payload[, opts]) -> Op
+--- opts: { timeout?: number, deadline?: number, backoff?: number, backoff_max?: number, request_id?: any }
+--- when performed -> reply_payload|nil, err|string|nil
+function Connection:call_op(topic, payload, opts)
+	opts = opts or {}
+	if type(opts) ~= 'table' then
+		error('call_op: opts must be a table (or nil)', 2)
+	end
+
+	return op.guard(function ()
+		assert_connected(self, 1)
+		assert_topic(topic, 'topic', 1)
+
+		assert_authorized(self, 'call', topic, {
+			payload = payload,
+			opts    = opts,
+		}, 1)
+
+		local bus = assert(self._bus)
+		assert_concrete_topic(bus._s_wild, bus._m_wild, topic, 'call topic', 2)
+
+		local timeout     = (type(opts.timeout) == 'number') and opts.timeout or 1.0
+		local deadline    = (type(opts.deadline) == 'number') and opts.deadline or (runtime.now() + timeout)
+		local backoff     = (type(opts.backoff) == 'number') and opts.backoff or 0.01
+		local backoff_max = (type(opts.backoff_max) == 'number') and opts.backoff_max or 0.2
+
+		local request_id  = (opts.request_id ~= nil) and opts.request_id or uuid.new()
+		local reply_topic = { request_id }
+
+		-- Bind reply endpoint first to avoid racing a fast responder.
+		-- Use bracket so abort/cleanup unbinds it.
+		return op.bracket(
+			function ()
+				return self:_bind_internal(reply_topic, { queue_len = 1 })
+			end,
+			function (rep_ep)
+				if rep_ep then pcall(function () rep_ep:unbind() end) end
+			end,
+			function (rep_ep)
+				-- Internal state machine (no worker fibre).
+				local phase    = 'publish' -- 'publish' -> 'wait_reply'
+				local next_try = runtime.now()
+				local b        = backoff
+
+				-- Precompute callee route key (topic is concrete).
+				local callee_key = topic_key(topic)
+
+				-- Check whether reply mailbox already has a buffered message.
+				-- This must be observational (no popping).
+				local function reply_buffered()
+					local rx = rep_ep and rep_ep._rx
+					local st = rx and rx._st
+					local buf = st and st.buf
+					return (buf and buf:length() > 0) or false
+				end
+
+				local function reply_closed()
+					local rx = rep_ep and rep_ep._rx
+					local st = rx and rx._st
+					return (not st) or st.closed or false
+				end
+
+				-- Attempt a single point-to-point publish without yielding.
+				-- Returns: ok:boolean, reason:any|nil
+				local function try_publish_once()
+					local ep = bus._endpoints and bus._endpoints[callee_key] or nil
+					if not ep or not ep._tx then
+						return false, 'no_route'
+					end
+
+					local msg = new_msg(topic, payload, reply_topic, request_id)
+
+					-- Use mailbox send_op's try_fn directly (non-yielding).
+					local send_op = ep._tx:send_op(msg)
+					local r1, r2, r3 = send_op.try_fn()
+
+					-- mailbox send semantics:
+					--   ready==true, ok==true              accepted
+					--   ready==true, ok==false, "full"     rejected by policy
+					--   ready==true, ok==nil               closed
+					--   ready==false                       would block (not possible for reject_newest/drop_oldest)
+					if not r1 then
+						-- Should not happen with bounded non-blocking policies.
+						return false, 'would_block'
+					end
+					if r2 == true then return true, nil end
+					if r2 == nil then return false, 'closed' end
+					return false, r3 or 'full'
+				end
+
+				-- Attempt a single reply receive without yielding.
+				-- Returns: have:boolean, payload:any|nil, err:any|nil
+				local function try_recv_reply()
+					-- Use raw mailbox recv_op's try_fn directly (non-yielding).
+					local rxop = rep_ep._rx:recv_op()
+					local ready, v = rxop.try_fn()
+					if not ready then
+						return false, nil, nil
+					end
+					if v == nil then
+						-- closed and drained
+						return true, nil, 'closed'
+					end
+					-- v is Message
+					return true, v.payload, nil
+				end
+
+				-- Probe step: observational only; never performs side effects.
+				local function probe_step()
+					local now = runtime.now()
+					if now >= deadline then
+						return true, function () return nil, 'timeout' end
+					end
+
+					-- If reply already buffered, ask to run immediately.
+					if phase == 'wait_reply' and reply_buffered() then
+						return false, 'run'
+					end
+
+					-- If reply endpoint is closed (and no buffered reply), this is terminal.
+					if phase == 'wait_reply' and reply_closed() and not reply_buffered() then
+						return true, function () return nil, 'closed' end
+					end
+
+					if phase == 'publish' then
+						if now >= next_try then
+							return false, 'run'
+						end
+						return false, 'timer'
+					end
+
+					-- wait_reply
+					return false, 'any'
+				end
+
+				-- Run step: performs bounded, non-yielding progress.
+				-- Returns either (true, thunk) terminal, or (false, want) to block.
+				local function run_step()
+					local now = runtime.now()
+					if now >= deadline then
+						return true, function () return nil, 'timeout' end
+					end
+
+					if phase == 'publish' then
+						if now < next_try then
+							return false, 'timer'
+						end
+
+						local ok_pub, reason = try_publish_once()
+						if ok_pub then
+							phase = 'wait_reply'
+							-- Fall through to reply attempt in the same tick.
+						else
+							-- Retry policy matches previous implementation.
+							if reason ~= 'full' and reason ~= 'no_route' and reason ~= 'closed' then
+								return true, function () return nil, tostring(reason) end
+							end
+
+							local remaining = deadline - runtime.now()
+							local dt = math.min(b, backoff_max, remaining)
+							if dt <= 0 then
+								return true, function () return nil, 'timeout' end
+							end
+
+							next_try = runtime.now() + dt
+							b = math.min(b * 2, backoff_max)
+							return false, 'timer'
+						end
+					end
+
+					-- phase == 'wait_reply'
+					local have, payload_out, err = try_recv_reply()
+					if have then
+						if err ~= nil then
+							return true, function () return nil, err end
+						end
+						return true, function () return payload_out, nil end
+					end
+
+					-- Not ready: wait for either reply or deadline.
+					return false, 'any'
+				end
+
+				-- Registration: arm wake-ups without exposing the scheduler.
+				---@param task Task
+				---@param waker table
+				---@param want any
+				local function register(task, waker, want)
+					-- Always arm the deadline timer (cannot cancel; benign if it fires after completion).
+					waker:at_time(deadline, task)
+
+					if want == 'run' then
+						waker:wakeup(task)
+						return { unlink = function () return false end }
+					end
+
+					if want == 'timer' then
+						waker:at_time(next_try, task)
+						return { unlink = function () return false end }
+					end
+
+					-- want == 'any' (or anything else): wait for reply arrival and deadline.
+					-- Rx:on_message uses the waker; no scheduler is referenced.
+					local tok = rep_ep._rx:on_message(task, waker)
+					return tok or { unlink = function () return false end }
+				end
+
+				-- Build the op: waitable2 returns packed results; we always return a thunk.
+				return wait.waitable2(register, probe_step, run_step)
+					:wrap(function (th)
+						return th()
+					end)
+			end
+		)
+	end)
+end
+
+function Connection:call(topic, payload, opts)
+	return perform(self:call_op(topic, payload, opts))
+end
+
+--------------------------------------------------------------------------------
+-- Bus public API
+--------------------------------------------------------------------------------
+
+--- connect([opts]) -> Connection
+--- opts: { principal?: any }
+function Bus:connect(opts)
+	opts = opts or {}
+	if type(opts) ~= 'table' then
+		error('connect: opts must be a table (or nil)', 2)
+	end
+
+	local s = scope_mod.current()
+	local conn = new_connection(self, opts.principal, self._q_length, self._full)
+	self._conns[conn] = true
+	s:finally(function () conn:disconnect() end)
+	return conn
+end
+
+function Bus:stats()
+	local connections, dropped = 0, 0
+	for conn in pairs(self._conns) do
+		connections = connections + 1
+		dropped = dropped + conn:dropped()
+	end
+	return {
+		connections = connections,
+		dropped     = dropped,
+		queue_len   = self._q_length,
+		full_policy = self._full,
+		s_wild      = self._s_wild,
+		m_wild      = self._m_wild,
+	}
+end
+
+--------------------------------------------------------------------------------
+-- Constructor
+--------------------------------------------------------------------------------
+
+---@param params? { q_length?: integer, full?: FullPolicy, s_wild?: string|number, m_wild?: string|number, authoriser?: any }
+---@return Bus
 local function new(params)
-    params = params or {}
-    local self = {
-        q_length = params.q_length or DEFAULT_Q_LEN,
-        topics = trie.new(params.s_wild or "+", params.m_wild or "#"),
-        retained_messages = trie.new(params.s_wild or "+", params.m_wild or "#"),
-    }
-    return setmetatable(self, Bus)
+	params = params or {}
+
+	local q_length = params.q_length
+	if q_length == nil then q_length = DEFAULT_Q_LEN end
+	if type(q_length) ~= 'number' or q_length < 0 then
+		error('bus.new: q_length must be >= 0', 2)
+	end
+
+	local full_default = assert_full_policy(params.full, 2) or DEFAULT_POLICY
+	local s_wild = params.s_wild or '+'
+	local m_wild = params.m_wild or '#'
+
+	return setmetatable({
+		_q_length  = q_length,
+		_full      = full_default,
+		_s_wild    = s_wild,
+		_m_wild    = m_wild,
+		_topics    = trie.new_pubsub(s_wild, m_wild),
+		_retained  = trie.new_retained(s_wild, m_wild),
+		_conns     = setmetatable({}, { __mode = 'k' }),
+		_endpoints = {}, -- lane B store
+		_authoriser = params.authoriser,
+	}, Bus)
 end
 
 return {
-    new = new,
-    new_msg = new_msg
+	new = new,
+
+	Bus          = Bus,
+	Connection   = Connection,
+	Subscription = Subscription,
+	Endpoint     = Endpoint,
+	Message      = Message,
+
+	-- Re-export trie literal helper for convenience.
+	literal = trie.literal,
 }
