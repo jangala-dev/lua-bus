@@ -38,6 +38,20 @@ local function topic_str(topic)
 	return table.concat(parts, '/')
 end
 
+local function assert_local_origin(origin, principal)
+	assert(type(origin) == 'table', 'expected origin table')
+	assert_eq(origin.kind, 'local', 'expected local origin kind')
+	assert(origin.conn_id ~= nil, 'expected conn_id in origin')
+	if principal ~= nil then
+		assert(origin.principal == principal, 'expected origin principal to match')
+	end
+end
+
+local function assert_origin_immutable(origin)
+	local ok = pcall(function () origin.kind = 'mutated' end)
+	assert(not ok, 'expected origin to be immutable')
+end
+
 -- A standard “deadline arm”: returns (nil, 'timeout').
 local function timeout_op(dt)
 	return Sleep.sleep_op(dt):wrap(function ()
@@ -48,25 +62,6 @@ end
 -- Named-choice convenience: returns (winner_name, ...arm_results...)
 local function select_named(arms)
 	return fibers.perform(fibers.named_choice(arms))
-end
-
--- Reply helper for mixed modalities:
--- - If reply_to is a Lane B endpoint, publish_one will deliver.
--- - If reply_to is a Lane A subscription topic, publish_one returns no_route; fall back to publish.
-local function reply_best_effort(conn, reply_to, payload, opts)
-	if not reply_to then return true end
-	opts = opts or {}
-
-	local ok, reason = conn:publish_one(reply_to, payload, opts)
-	if ok then return true end
-
-	if reason == 'no_route' then
-		conn:publish(reply_to, payload, opts)
-		return true
-	end
-
-	-- For tests: surface other failures explicitly.
-	return false, reason
 end
 
 --------------------------------------------------------------------------------
@@ -127,6 +122,8 @@ local function test_simple()
 
 	local msg, err = fibers.perform(sub:recv_op())
 	assert(msg and msg.payload == 'Hello' and err == nil)
+	assert_local_origin(msg.origin)
+	assert_origin_immutable(msg.origin)
 
 	print('Simple test passed!')
 end
@@ -295,6 +292,8 @@ local function test_retained_msg_basic()
 	local sub = conn:subscribe({ 'retained', 'topic' })
 	local msg, err = fibers.perform(sub:recv_op())
 	assert(msg and msg.payload == 'RetainedMessage' and err == nil)
+	assert_local_origin(msg.origin)
+	assert_origin_immutable(msg.origin)
 
 	print('Retained message (basic) test passed!')
 end
@@ -376,6 +375,8 @@ local function test_retained_watch_replay_and_live_changes()
 		assert_eq(ev.op, 'retain')
 		assert_eq(topic_str(ev.topic), 'watch/a')
 		assert_eq(ev.payload, 'A1')
+		assert_local_origin(ev.origin)
+		assert_origin_immutable(ev.origin)
 	end
 
 	conn:retain({ 'watch', 'b' }, 'B1')
@@ -386,6 +387,7 @@ local function test_retained_watch_replay_and_live_changes()
 		assert_eq(ev.op, 'retain')
 		assert_eq(topic_str(ev.topic), 'watch/b')
 		assert_eq(ev.payload, 'B1')
+		assert_local_origin(ev.origin)
 	end
 
 	conn:unretain({ 'watch', 'a' })
@@ -396,6 +398,7 @@ local function test_retained_watch_replay_and_live_changes()
 		assert_eq(ev.op, 'unretain')
 		assert_eq(topic_str(ev.topic), 'watch/a')
 		assert(ev.payload == nil, 'expected nil payload for unretain')
+		assert_local_origin(ev.origin)
 	end
 
 	-- Ordinary publish should not appear on retained watch feeds.
@@ -840,41 +843,37 @@ local function test_laneA_fanout_independent_backpressure()
 end
 
 --------------------------------------------------------------------------------
--- Lane B: endpoints, publish_one admission, and call
+-- Lane B: endpoints and call
 --------------------------------------------------------------------------------
 
-local function test_laneB_publish_one_modalities()
-	local bus  = Bus.new({ m_wild = '#', s_wild = '+' })
-	local conn = bus:connect()
+local function test_laneB_call_full_and_closed_modalities()
+	local bus    = Bus.new({ m_wild = '#', s_wild = '+' })
+	local server = bus:connect()
+	local client = bus:connect()
+
+	local ep = server:bind({ 'svc', 'rzv' }, { queue_len = 0 })
 
 	do
-		local ok, reason = conn:publish_one({ 'svc', 'missing' }, 'x')
-		assert_eq(ok, false)
-		assert_eq(reason, 'no_route')
-	end
-
-	local ep = conn:bind({ 'svc', 'rzv' }, { queue_len = 0 })
-
-	do
-		local ok, reason = conn:publish_one({ 'svc', 'rzv' }, 'x')
-		assert_eq(ok, false)
-		assert_eq(reason, 'full')
+		local reply, err = client:call({ 'svc', 'rzv' }, 'x', { timeout = TMO })
+		assert(reply == nil)
+		assert_eq(err, 'full')
 		assert_eq(ep:dropped(), 1)
 	end
 
 	local got = Channel.new(1)
 	fibers.spawn(function ()
-		local msg, err = ep:recv()
-		assert(msg, tostring(err))
-		got:put(msg.payload)
+		local req, err = ep:recv()
+		assert(req, tostring(err))
+		got:put(req.payload)
+		assert(req:reply('reply:' .. tostring(req.payload)))
 	end)
 
 	Sleep.sleep(TMO)
 
 	do
-		local ok, reason = conn:publish_one({ 'svc', 'rzv' }, 'hello')
-		assert_eq(ok, true)
-		assert(reason == nil)
+		local reply, err = client:call({ 'svc', 'rzv' }, 'hello', { timeout = LONG_TMO })
+		assert(err == nil, tostring(err))
+		assert_eq(reply, 'reply:hello')
 	end
 
 	do
@@ -890,48 +889,54 @@ local function test_laneB_publish_one_modalities()
 	ep._tx:close('manual close')
 
 	do
-		local ok, reason = conn:publish_one({ 'svc', 'rzv' }, 'x')
-		assert_eq(ok, false)
-		assert_eq(reason, 'closed')
+		local reply, err = client:call({ 'svc', 'rzv' }, 'x', { timeout = TMO })
+		assert(reply == nil)
+		assert_eq(err, 'closed')
 	end
 
-	print('Lane B publish_one modalities test passed!')
+	print('Lane B call full/closed modalities test passed!')
 end
 
 local function test_laneB_concrete_topic_enforcement_and_literal_ok()
-	local bus  = Bus.new({ m_wild = '#', s_wild = '+' })
-	local conn = bus:connect()
+	local bus    = Bus.new({ m_wild = '#', s_wild = '+' })
+	local server = bus:connect()
+	local client = bus:connect()
 
 	local ok1 = pcall(function ()
-		conn:bind({ 'svc', '+' }, { queue_len = 1 })
+		server:bind({ 'svc', '+' }, { queue_len = 1 })
 	end)
 	assert(not ok1, 'expected bind with wildcard to error')
 
 	local ok2 = pcall(function ()
-		conn:publish_one({ 'svc', '+' }, 'x')
+		fibers.perform(client:call_op({ 'svc', '+' }, 'x', { timeout = TMO }))
 	end)
-	assert(not ok2, 'expected publish_one with wildcard topic to error')
+	assert(not ok2, 'expected call with wildcard topic to error')
 
-	local ep = conn:bind({ 'svc', Bus.literal('+') }, { queue_len = 1 })
+	local ep = server:bind({ 'svc', Bus.literal('+') }, { queue_len = 1 })
 	assert(ep, 'expected bind with literal "+" to succeed')
 
-	local ok3, reason3 = conn:publish_one({ 'svc', Bus.literal('+') }, 'ok')
-	assert(ok3 == true and reason3 == nil)
+	fibers.spawn(function ()
+		local req, err = ep:recv()
+		assert(req, tostring(err))
+		assert(req:reply('ok'))
+	end)
 
-	local msg, err = ep:recv()
-	assert(err == nil and msg and msg.payload == 'ok')
+	local reply, err = client:call({ 'svc', Bus.literal('+') }, 'go', { timeout = LONG_TMO })
+	assert(err == nil, tostring(err))
+	assert_eq(reply, 'ok')
 
 	print('Lane B concrete-topic enforcement + literal wrapper test passed!')
 end
 
--- Explicit modality check: publish() does not reach endpoints; publish_one() does.
+-- Explicit modality check: publish() does not reach endpoints; call() does.
 local function test_laneB_endpoint_not_reached_by_publish()
-	local bus  = Bus.new({ m_wild = '#', s_wild = '+' })
-	local conn = bus:connect()
+	local bus    = Bus.new({ m_wild = '#', s_wild = '+' })
+	local server = bus:connect()
+	local client = bus:connect()
 
-	local ep = conn:bind({ 'endpoint', 'only' }, { queue_len = 1 })
+	local ep = server:bind({ 'endpoint', 'only' }, { queue_len = 1 })
 
-	conn:publish({ 'endpoint', 'only' }, 'x')
+	client:publish({ 'endpoint', 'only' }, 'x')
 
 	local which, msg, err = select_named({
 		msg      = ep:recv_op(),
@@ -940,33 +945,37 @@ local function test_laneB_endpoint_not_reached_by_publish()
 	assert_eq(which, 'deadline')
 	assert_timeout(msg, err)
 
-	local ok, reason = conn:publish_one({ 'endpoint', 'only' }, 'y')
-	assert_eq(ok, true)
-	assert(reason == nil)
+	fibers.spawn(function ()
+		local req, rerr = ep:recv()
+		assert(req, tostring(rerr))
+		assert(req:reply('y'))
+	end)
 
-	local m2, e2 = fibers.perform(ep:recv_op())
-	assert(e2 == nil and m2 and m2.payload == 'y')
+	local reply, cerr = client:call({ 'endpoint', 'only' }, 'call', { timeout = LONG_TMO })
+	assert(cerr == nil, tostring(cerr))
+	assert_eq(reply, 'y')
 
 	print('Lane B endpoint not reached by publish test passed!')
 end
 
 local function test_laneB_call_success()
-	local bus    = Bus.new({ m_wild = '#', s_wild = '+' })
-	local server = bus:connect()
-	local client = bus:connect()
+	local bus       = Bus.new({ m_wild = '#', s_wild = '+' })
+	local server    = bus:connect({ principal = admin_principal('server') })
+	local caller_pr = admin_principal('client')
+	local client    = bus:connect({ principal = caller_pr })
 
 	local ep = server:bind({ 'rpc', 'echo' }, { queue_len = 1 })
 
 	fibers.spawn(function ()
-		while true do
-			local msg, err = ep:recv()
-			if not msg then return end
-			if msg.reply_to then
-				local ok, why = reply_best_effort(server, msg.reply_to, 'reply:' .. tostring(msg.payload),
-					{ id = msg.id })
-				assert(ok, tostring(why))
-			end
-		end
+		local req, err = ep:recv()
+		assert(req, tostring(err))
+		assert_eq(req.payload, 'hi')
+		assert_local_origin(req.origin, caller_pr)
+		assert_origin_immutable(req.origin)
+		assert(not req:done(), 'request should not be done before reply')
+		assert(req:reply('reply:' .. tostring(req.payload)))
+		assert(req:done(), 'request should be done after reply')
+		assert(req:reply('again') == false, 'second reply should fail')
 	end)
 
 	local reply, err = client:call({ 'rpc', 'echo' }, 'hi', { timeout = LONG_TMO })
@@ -977,135 +986,67 @@ local function test_laneB_call_success()
 	print('Lane B call (success) test passed!')
 end
 
-local function test_laneB_call_timeout_no_route()
+local function test_laneB_call_no_route()
 	local bus  = Bus.new({ m_wild = '#', s_wild = '+' })
 	local conn = bus:connect()
 
 	local reply, err = conn:call({ 'rpc', 'nobody' }, 'hi', { timeout = TMO })
 	assert(reply == nil)
+	assert_eq(err, 'no_route')
+
+	print('Lane B call (no_route) test passed!')
+end
+
+local function test_laneB_call_timeout_no_reply()
+	local bus       = Bus.new({ m_wild = '#', s_wild = '+' })
+	local server    = bus:connect()
+	local caller_pr = admin_principal('timeout-client')
+	local client    = bus:connect({ principal = caller_pr })
+
+	local ep      = server:bind({ 'rpc', 'timeout' }, { queue_len = 1 })
+	local late_ok = Channel.new(1)
+
+	fibers.spawn(function ()
+		local req, err = ep:recv()
+		assert(req, tostring(err))
+		assert_local_origin(req.origin, caller_pr)
+		Sleep.sleep(LONG_TMO)
+		late_ok:put(req:reply('late'))
+	end)
+
+	local reply, err = client:call({ 'rpc', 'timeout' }, 'slow', { timeout = TMO })
+	assert(reply == nil)
 	assert_eq(err, 'timeout')
 
-	print('Lane B call (timeout no_route) test passed!')
-end
-
---------------------------------------------------------------------------------
--- Request_sub (multi-reply) with “read until deadline” policy
---------------------------------------------------------------------------------
-
-local function test_request_sub()
-	local bus = Bus.new({ m_wild = '#', s_wild = '+' })
-
-	fibers.spawn(function ()
-		local conn     = bus:connect()
-		local helper   = conn:subscribe({ 'helpme' })
-		local rec, err = helper:recv()
-		assert(rec, tostring(err))
-		local ok, why = reply_best_effort(conn, rec.reply_to, 'Sure ' .. tostring(rec.payload), { id = rec.id })
-		assert(ok, tostring(why))
-	end)
-
-	fibers.spawn(function ()
-		local conn     = bus:connect()
-		local helper   = conn:subscribe({ 'helpme' })
-		local rec, err = helper:recv()
-		assert(rec, tostring(err))
-		Sleep.sleep(0.1)
-		local ok, why = reply_best_effort(conn, rec.reply_to, 'No problem ' .. tostring(rec.payload), { id = rec.id })
-		assert(ok, tostring(why))
-	end)
-
-	Sleep.sleep(0.05)
-
-	local conn3 = bus:connect()
-	local sub   = conn3:request_sub({ 'helpme' }, 'John')
-
-	do
-		local which, msg, err = select_named({
-			reply    = sub:recv_op(),
-			deadline = timeout_op(LONG_TMO),
-		})
-		assert_eq(which, 'reply')
-		assert(err == nil and msg and msg.payload == 'Sure John')
-	end
-
-	do
-		local which, msg, err = select_named({
-			reply    = sub:recv_op(),
-			deadline = timeout_op(LONG_TMO),
-		})
-		assert_eq(which, 'reply')
-		assert(err == nil and msg and msg.payload == 'No problem John')
-	end
-
-	do
-		local which, msg, err = select_named({
-			reply    = sub:recv_op(),
-			deadline = timeout_op(TMO),
-		})
-		assert_eq(which, 'deadline')
-		assert_timeout(msg, err)
-	end
-
-	sub:unsubscribe()
-
-	print('Request_sub (multi-reply) test passed!')
-end
-
---------------------------------------------------------------------------------
--- Request_once as a plain Op (caller composes policy)
---------------------------------------------------------------------------------
-
-local function test_request_once_composed()
-	local bus = Bus.new({ m_wild = '#', s_wild = '+' })
-
-	fibers.spawn(function ()
-		local conn     = bus:connect()
-		local helper   = conn:subscribe({ 'helpme' })
-		local rec, err = helper:recv()
-		assert(rec, tostring(err))
-		local ok, why = reply_best_effort(conn, rec.reply_to, 'Sure ' .. tostring(rec.payload), { id = rec.id })
-		assert(ok, tostring(why))
-	end)
-
-	fibers.spawn(function ()
-		local conn     = bus:connect()
-		local helper   = conn:subscribe({ 'helpme' })
-		local rec, err = helper:recv()
-		assert(rec, tostring(err))
-		Sleep.sleep(0.1)
-		local ok, why = reply_best_effort(conn, rec.reply_to, 'No problem ' .. tostring(rec.payload), { id = rec.id })
-		assert(ok, tostring(why))
-	end)
-
-	Sleep.sleep(0.05)
-
-	local conn3 = bus:connect()
-
-	local which, reply, err = select_named({
-		reply    = conn3:request_once_op({ 'helpme' }, 'John'),
+	local which, ok, cherr = select_named({
+		late     = late_ok:get_op():wrap(function (v) return v, nil end),
 		deadline = timeout_op(LONG_TMO),
 	})
+	assert_eq(which, 'late')
+	assert(cherr == nil)
+	assert_eq(ok, false)
 
-	assert_eq(which, 'reply')
-	assert(err == nil, tostring(err))
-	assert(reply and reply.payload == 'Sure John')
-
-	print('Request_once (reply wins) test passed!')
+	print('Lane B call (timeout no reply) test passed!')
 end
 
-local function test_request_once_deadline_no_responder()
-	local bus  = Bus.new({ m_wild = '#', s_wild = '+' })
-	local conn = bus:connect()
+local function test_laneB_call_fail_propagates_error()
+	local bus    = Bus.new({ m_wild = '#', s_wild = '+' })
+	local server = bus:connect()
+	local client = bus:connect()
 
-	local which, reply, err = select_named({
-		reply    = conn:request_once_op({ 'noonehome' }, 'John'),
-		deadline = timeout_op(TMO),
-	})
+	local ep = server:bind({ 'rpc', 'fail' }, { queue_len = 1 })
 
-	assert_eq(which, 'deadline')
-	assert_timeout(reply, err)
+	fibers.spawn(function ()
+		local req, err = ep:recv()
+		assert(req, tostring(err))
+		assert(req:fail('boom'))
+	end)
 
-	print('Request_once (deadline wins) test passed!')
+	local reply, err = client:call({ 'rpc', 'fail' }, 'x', { timeout = LONG_TMO })
+	assert(reply == nil)
+	assert_eq(err, 'boom')
+
+	print('Lane B call (fail propagates error) test passed!')
 end
 
 --------------------------------------------------------------------------------
@@ -1201,6 +1142,7 @@ local function test_authz_admin_allows_and_records_actions()
 	do
 		local msg, err = fibers.perform(sub:recv_op())
 		assert(err == nil and msg and msg.payload == 'hello')
+		assert_local_origin(msg.origin, admin1)
 	end
 
 	-- retain + unretain
@@ -1228,48 +1170,17 @@ local function test_authz_admin_allows_and_records_actions()
 		local ev, err = fibers.perform(rw:recv_op())
 		assert(err == nil and ev and ev.op == 'retain')
 		assert_eq(ev.payload, 'W')
+		assert_local_origin(ev.origin, admin1)
 	end
 	rw:unwatch()
 
-	-- bind + publish_one
-	local ep = conn1:bind({ 'authz', 'ep' }, { queue_len = 1 })
-	do
-		local ok, reason = conn1:publish_one({ 'authz', 'ep' }, 'E')
-		assert_eq(ok, true)
-		assert(reason == nil)
-	end
-	do
-		local msg, err = fibers.perform(ep:recv_op())
-		assert(err == nil and msg and msg.payload == 'E')
-	end
-
-	-- request_sub
-	fibers.spawn(function()
-		local helper_sub = conn2:subscribe({ 'authz', 'request' })
-		local msg, err = helper_sub:recv()
-		assert(msg, tostring(err))
-		local ok, why = reply_best_effort(conn2, msg.reply_to, 'reply:' .. tostring(msg.payload), { id = msg.id })
-		assert(ok, tostring(why))
-	end)
-	Sleep.sleep(TMO)
-	local req_sub = conn1:request_sub({ 'authz', 'request' }, 'Q')
-	do
-		local which, msg, err = select_named({
-			reply    = req_sub:recv_op(),
-			deadline = timeout_op(LONG_TMO),
-		})
-		assert_eq(which, 'reply')
-		assert(err == nil and msg and msg.payload == 'reply:Q')
-	end
-	req_sub:unsubscribe()
-
-	-- call
+	-- bind + call
 	local rpc_ep = conn2:bind({ 'authz', 'rpc' }, { queue_len = 1 })
 	fibers.spawn(function()
-		local msg, err = rpc_ep:recv()
-		assert(msg, tostring(err))
-		local ok, why = reply_best_effort(conn2, msg.reply_to, 'rpc:' .. tostring(msg.payload), { id = msg.id })
-		assert(ok, tostring(why))
+		local req, err = rpc_ep:recv()
+		assert(req, tostring(err))
+		assert_local_origin(req.origin, admin1)
+		assert(req:reply('rpc:' .. tostring(req.payload)))
 	end)
 	do
 		local reply, err = conn1:call({ 'authz', 'rpc' }, 'C', { timeout = LONG_TMO })
@@ -1277,7 +1188,6 @@ local function test_authz_admin_allows_and_records_actions()
 		assert_eq(reply, 'rpc:C')
 	end
 	rpc_ep:unbind()
-	ep:unbind()
 
 	local actions = {}
 	for i = 1, #seen do
@@ -1291,8 +1201,6 @@ local function test_authz_admin_allows_and_records_actions()
 	assert(actions.unretain,       'expected unretain action to be authorised')
 	assert(actions.watch_retained, 'expected watch_retained action to be authorised')
 	assert(actions.bind,           'expected bind action to be authorised')
-	assert(actions.publish_one,    'expected publish_one action to be authorised')
-	assert(actions.request,        'expected request action to be authorised')
 	assert(actions.call,           'expected call action to be authorised')
 
 	print('Authz admin allow/record test passed!')
@@ -1331,15 +1239,13 @@ fibers.run(function ()
 
 	test_laneA_fanout_independent_backpressure()
 
-	test_laneB_publish_one_modalities()
+	test_laneB_call_full_and_closed_modalities()
 	test_laneB_concrete_topic_enforcement_and_literal_ok()
 	test_laneB_endpoint_not_reached_by_publish()
 	test_laneB_call_success()
-	test_laneB_call_timeout_no_route()
-
-	test_request_sub()
-	test_request_once_composed()
-	test_request_once_deadline_no_responder()
+	test_laneB_call_no_route()
+	test_laneB_call_timeout_no_reply()
+	test_laneB_call_fail_propagates_error()
 
 	test_scope_cancellation_terminates_waits()
 	test_authz_denies_without_admin_role()
