@@ -6,36 +6,34 @@ The `bus` module provides a bounded, in-process messaging fabric built on `fiber
 
 It is intended for cooperative, single-threaded systems running under `fibers.run(...)`, where:
 
-* delivery is **bounded**: every subscription, retained watch, and endpoint has a finite queue, which may be zero-length, and
-* routing is **non-blocking**: a slow consumer does not stall publishers or callers.
+- delivery is **bounded**: every subscription, retained watch, and endpoint has a finite queue, which may be zero-length
+- routing is **non-blocking**: a slow consumer does not stall publishers or callers
 
 The bus exposes two public planes only:
 
-* a **state/event plane** for publish/subscribe and retained state, and
-* a **command plane** for concrete point-to-point request/reply.
+- a **state/event plane** for publish/subscribe and retained state
+- a **command plane** for concrete point-to-point request/reply
 
-This keeps the programming model small and explicit:
+That gives a small, explicit programming model:
 
-* **publish** facts,
-* **retain** current truth,
-* **call** owned actions.
+- **publish** facts
+- **retain** current truth
+- **call** owned actions
 
 ## Internal indexes
 
 The bus uses three tries:
 
-* a **pubsub trie** for ordinary subscriptions
+- a **pubsub trie** for ordinary subscriptions
   wildcards are allowed in stored subscription patterns; published topics are concrete queries
 
-* a **retained trie** for retained state
+- a **retained trie** for retained state
   retained topics are stored as concrete keys; subscriptions and retained watches may query with wildcards
 
-* a **retained-watch trie** for retained lifecycle feeds
-  wildcards are allowed in stored watch patterns; retained writes/removals are concrete queries
+- a **retained-watch trie** for retained lifecycle feeds
+  wildcards are allowed in stored watch patterns; retained writes and removals are concrete queries
 
 Endpoints are stored separately in a concrete-topic registry.
-
----
 
 ## Core concepts
 
@@ -77,12 +75,14 @@ Delivered to retained watches:
 
 ```lua
 {
-  op      = 'retain' | 'unretain',
-  topic   = <Topic>,
+  op      = 'retain' | 'unretain' | 'replay_done',
+  topic   = <Topic|nil>,
   payload = <any|nil>,
   origin  = <Origin>,
 }
 ```
+
+`replay_done` is a synthetic control event emitted only for retained watches created with `replay = true`.
 
 ### Request
 
@@ -121,18 +121,14 @@ Immutable provenance attached by the bus:
 
 For ordinary local traffic, only some fields are populated. Fields such as `link_id`, `peer_node`, `peer_sid`, and `generation` are intended for provenance-aware federation layers such as `fabric`.
 
----
-
 ## Assumptions and semantics
 
-* Use from within `fibers.run(...)`.
-* Delivery is always bounded.
-* The bus never uses blocking queue policy.
-* Slow consumers lose data according to their mailbox policy; they do not stall the system.
-* Timeouts are not built into subscriptions or retained watches; compose them externally with `fibers.choice`, `fibers.named_choice`, and `fibers.sleep.sleep_op(...)`.
-* `call(...)` supports timeout/deadline directly because bounded request/reply is part of the command plane.
-
----
+- Use from within `fibers.run(...)`.
+- Delivery is always bounded.
+- The bus never uses blocking queue policy.
+- Slow consumers lose data according to their mailbox policy; they do not stall the system.
+- Timeouts are not built into subscriptions or retained watches; compose them externally with `fibers.choice`, `fibers.named_choice`, and `fibers.sleep.sleep_op(...)`.
+- `call(...)` supports timeout/deadline directly because bounded request/reply is part of the command plane.
 
 ## Topics, wildcards, and literals
 
@@ -148,8 +144,8 @@ Tokens must be strings or numbers.
 
 Subscription and retained-watch patterns may use:
 
-* single-level wildcard: `+`
-* multi-level wildcard: `#`
+- single-level wildcard: `+`
+- multi-level wildcard: `#`
 
 These tokens are configurable with `s_wild` and `m_wild`.
 
@@ -165,21 +161,18 @@ local topic = { 'cfg', Bus.literal('+') }
 
 A literal wildcard token is treated as concrete for:
 
-* endpoint binding,
-* point-to-point calls,
-* and ordinary literal matching.
-
----
+- endpoint binding
+- point-to-point calls
+- ordinary literal matching
 
 ## Delivery, queues, and full policy
 
 Each subscription, retained watch, and endpoint mailbox has:
 
-* `queue_len` — integer, `>= 0`
-* `full` policy:
-
-  * `"drop_oldest"` (default)
-  * `"reject_newest"`
+- `queue_len` — integer, `>= 0`
+- `full` policy:
+  - `"drop_oldest"` (default)
+  - `"reject_newest"`
 
 `"block"` is rejected. The bus is intentionally bounded and non-blocking.
 
@@ -187,8 +180,8 @@ Each subscription, retained watch, and endpoint mailbox has:
 
 A queue length of `0` creates rendezvous-style delivery:
 
-* delivery succeeds only if a receiver is waiting at send time,
-* otherwise the item is rejected by mailbox policy.
+- delivery succeeds only if a receiver is waiting at send time
+- otherwise the item is rejected by mailbox policy
 
 This can be useful for highly transient traffic where stale queueing is undesirable.
 
@@ -196,28 +189,26 @@ This can be useful for highly transient traffic where stale queueing is undesira
 
 Drops are tracked per handle and in aggregate:
 
-* `sub:dropped()`
-* `watch:dropped()`
-* `ep:dropped()`
-* `conn:dropped()`
-* `bus:stats().dropped`
+- `sub:dropped()`
+- `watch:dropped()`
+- `ep:dropped()`
+- `conn:dropped()`
+- `bus:stats().dropped`
 
 The count includes both:
 
-* buffered evictions under `"drop_oldest"`, and
-* admission failures under `"reject_newest"`.
-
----
+- buffered evictions under `"drop_oldest"`, and
+- admission failures under `"reject_newest"`
 
 ## State/event plane
 
 The state/event plane consists of:
 
-* `publish`
-* `retain`
-* `unretain`
-* `subscribe`
-* `watch_retained`
+- `publish`
+- `retain`
+- `unretain`
+- `subscribe`
+- `watch_retained`
 
 ### Ordinary publish
 
@@ -225,8 +216,8 @@ An ordinary publish fans out to matching subscriptions only.
 
 Publishing is best-effort per subscriber:
 
-* the bus attempts one immediate enqueue into each matching subscription mailbox,
-* if that subscriber cannot accept the item, it is dropped for that subscriber.
+- the bus attempts one immediate enqueue into each matching subscription mailbox
+- if that subscriber cannot accept the item, it is dropped for that subscriber
 
 ### Retained state
 
@@ -238,8 +229,8 @@ conn:retain({ 'fw', 'version' }, '1.2.3')
 
 does two things:
 
-1. it publishes the message to matching ordinary subscriptions, and
-2. it stores the retained value under that concrete topic.
+1. it publishes the message to matching ordinary subscriptions
+2. it stores the retained value under that concrete topic
 
 A retained removal:
 
@@ -274,32 +265,39 @@ On unretain:
 }
 ```
 
+On replay completion:
+
+```lua
+{
+  op     = 'replay_done',
+  topic  = nil,
+  origin = { kind = 'bus', ... },
+}
+```
+
 Retained watches are independent of ordinary subscriptions.
 
 ### Replay on retained watch creation
 
-`watch_retained(...)` accepts `replay = true`, which emits synthetic `retain` events for the current retained values matching the pattern.
+`watch_retained(...)` accepts `replay = true`, which emits synthetic `retain` events for the current retained values matching the pattern, followed by exactly one synthetic `replay_done` event.
 
-This is useful when a consumer needs:
+This marker means the initial replay scan has completed. It does **not** imply global quiescence. Live retained updates may occur while replay is in progress and may be observed before or after `replay_done`, depending on timing.
 
-* the current retained image, and
-* subsequent retained changes.
-
----
+If the bus cannot deliver `replay_done`, the watch is closed rather than silently dropping the marker.
 
 ## Command plane
 
 The command plane consists of:
 
-* `bind`
-* `call`
+- `bind`
+- `call`
 
 A call targets exactly one concrete endpoint topic.
 
 Endpoint handlers do not reply by publishing to reply topics. They receive a `Request` object and complete it directly with:
 
-* `req:reply(value)`, or
-* `req:fail(err)`.
+- `req:reply(value)`, or
+- `req:fail(err)`
 
 This keeps request/reply separate from ordinary pub/sub.
 
@@ -307,22 +305,21 @@ This keeps request/reply separate from ordinary pub/sub.
 
 Bound endpoints are point-to-point and admission-signalled:
 
-* if no endpoint is bound, the call fails with `no_route`
-* if the endpoint queue is full, the call fails with `full`
-* if the endpoint closes before replying, the caller sees `closed`
-* if the deadline expires first, the caller sees `timeout`
+- if no endpoint is bound, the call fails with `no_route`
+- if the endpoint queue is full, the call fails with `full`
+- if the endpoint closes before replying, the caller sees `closed`
+- if the deadline expires first, the caller sees `timeout`
 
 Exact error values depend on the bus implementation, but these are the intended categories.
-
----
 
 ## Installation
 
 Dependencies:
 
-* `fibers`
-* `trie` with pubsub and retained support
-* `trie.literal`
+- `fibers`
+- `trie` with pubsub and retained support
+- `trie.literal`
+- `uuid`
 
 Load with:
 
@@ -330,18 +327,16 @@ Load with:
 local Bus = require 'bus'
 ```
 
----
-
 ## API summary
 
-## Bus
+### Bus
 
-* `Bus.new(params?) -> bus`
-* `bus:connect(opts?) -> conn`
-* `bus:stats() -> table`
-* `Bus.literal(v) -> literal_token`
+- `Bus.new(params?) -> bus`
+- `bus:connect(opts?) -> conn`
+- `bus:stats() -> table`
+- `Bus.literal(v) -> literal_token`
 
-### Constructor parameters
+Constructor parameters:
 
 ```lua
 {
@@ -353,7 +348,7 @@ local Bus = require 'bus'
 }
 ```
 
-### `connect` options
+`connect` options:
 
 ```lua
 {
@@ -362,113 +357,80 @@ local Bus = require 'bus'
 }
 ```
 
-`origin_base` is optional per-connection origin metadata that the bus may merge into emitted origin values.
+### Connection
 
----
+State/event plane:
 
-## Connection
+- `conn:publish(topic, payload[, opts]) -> true`
+- `conn:retain(topic, payload[, opts]) -> true`
+- `conn:unretain(topic[, opts]) -> true`
+- `conn:subscribe(topic[, opts]) -> sub`
+- `conn:unsubscribe(sub) -> true`
+- `conn:watch_retained(topic[, opts]) -> watch`
+- `conn:unwatch_retained(watch) -> true`
 
-### State/event plane
+Command plane:
 
-* `conn:publish(topic, payload[, opts]) -> true`
-* `conn:retain(topic, payload[, opts]) -> true`
-* `conn:unretain(topic[, opts]) -> true`
-* `conn:subscribe(topic[, opts]) -> sub`
-* `conn:unsubscribe(sub) -> true`
-* `conn:watch_retained(topic[, opts]) -> watch`
-* `conn:unwatch_retained(watch) -> true`
+- `conn:bind(topic[, opts]) -> endpoint`
+- `conn:unbind(endpoint) -> true`
+- `conn:call_op(topic, payload[, opts]) -> Op`
+- `conn:call(topic, payload[, opts]) -> value|nil, err|nil`
 
-### Command plane
+Lifecycle and stats:
 
-* `conn:bind(topic[, opts]) -> endpoint`
-* `conn:unbind(endpoint) -> true`
-* `conn:call_op(topic, payload[, opts]) -> Op`
-* `conn:call(topic, payload[, opts]) -> value|nil, err|nil`
+- `conn:disconnect() -> true`
+- `conn:is_disconnected() -> boolean`
+- `conn:principal() -> any|nil`
+- `conn:dropped() -> integer`
+- `conn:stats() -> table`
 
-### Lifecycle and stats
+### Subscription
 
-* `conn:disconnect() -> true`
-* `conn:is_disconnected() -> boolean`
-* `conn:principal() -> any|nil`
-* `conn:dropped() -> integer`
-* `conn:stats() -> table`
+- `sub:recv_op() -> Op` yielding `(Message|nil, err|string|nil)`
+- `sub:recv() -> Message|nil, err|string|nil`
+- `sub:unsubscribe() -> true`
+- `sub:iter() -> iterator<Message>`
+- `sub:payloads() -> iterator<any>`
+- `sub:why() -> any|nil`
+- `sub:dropped() -> integer`
+- `sub:topic() -> Topic`
+- `sub:stats() -> table`
 
-### Common options
+### RetainedWatch
 
-For `publish`, `retain`, `unretain`, and `call`, implementations may accept:
+- `watch:recv_op() -> Op` yielding `(RetainedEvent|nil, err|string|nil)`
+- `watch:recv() -> RetainedEvent|nil, err|string|nil`
+- `watch:unwatch() -> true`
+- `watch:iter() -> iterator<RetainedEvent>`
+- `watch:why() -> any|nil`
+- `watch:dropped() -> integer`
+- `watch:topic() -> Topic`
+- `watch:stats() -> table`
 
-```lua
-{
-  origin? = table|nil,
-}
-```
+### Endpoint
 
-For `call`, implementations may also accept:
+- `ep:recv_op() -> Op` yielding `(Request|nil, err|string|nil)`
+- `ep:recv() -> Request|nil, err|string|nil`
+- `ep:iter() -> iterator<Request>`
+- `ep:unbind() -> true`
+- `ep:why() -> any|nil`
+- `ep:dropped() -> integer`
+- `ep:topic() -> Topic`
 
-```lua
-{
-  timeout?  = number,
-  deadline? = number,
-}
-```
+### Request
 
----
+- `req.topic`
+- `req.payload`
+- `req.origin`
+- `req:reply(value) -> boolean`
+- `req:fail(err) -> boolean`
+- `req:done() -> boolean`
 
-## Subscription
-
-* `sub:recv_op() -> Op` yielding `(Message|nil, err|string|nil)`
-* `sub:recv() -> Message|nil, err|string|nil`
-* `sub:unsubscribe() -> true`
-* `sub:iter() -> iterator<Message>`
-* `sub:payloads() -> iterator<any>`
-* `sub:why() -> any|nil`
-* `sub:dropped() -> integer`
-* `sub:topic() -> Topic`
-* `sub:stats() -> table`
-
----
-
-## RetainedWatch
-
-* `watch:recv_op() -> Op` yielding `(RetainedEvent|nil, err|string|nil)`
-* `watch:recv() -> RetainedEvent|nil, err|string|nil`
-* `watch:unwatch() -> true`
-* `watch:iter() -> iterator<RetainedEvent>`
-* `watch:why() -> any|nil`
-* `watch:dropped() -> integer`
-* `watch:topic() -> Topic`
-* `watch:stats() -> table`
-
----
-
-## Endpoint
-
-* `ep:recv_op() -> Op` yielding `(Request|nil, err|string|nil)`
-* `ep:recv() -> Request|nil, err|string|nil`
-* `ep:iter() -> iterator<Request>`
-* `ep:unbind() -> true`
-* `ep:why() -> any|nil`
-* `ep:dropped() -> integer`
-* `ep:topic() -> Topic`
-
----
-
-## Request
-
-* `req.topic`
-* `req.payload`
-* `req.origin`
-* `req:reply(value) -> boolean`
-* `req:fail(err) -> boolean`
-* `req:done() -> boolean`
-
-A request may be completed once only. Subsequent `reply` or `fail` attempts return false or have no effect, depending on implementation.
-
----
+A request may be completed once only.
 
 ## Usage
 
-## Create a bus
+### Create a bus
 
 ```lua
 local Bus = require 'bus'
@@ -489,7 +451,7 @@ local bus = Bus.new{
 }
 ```
 
-## Connect
+### Connect
 
 Connections are scope-bound by default:
 
@@ -505,15 +467,11 @@ local conn = bus:connect{
 }
 ```
 
----
-
-## Publish
+### Publish
 
 ```lua
 conn:publish({ 'net', 'link' }, { ifname = 'eth0', up = true })
 ```
-
-Publishing never waits for consumers.
 
 Consume it:
 
@@ -529,20 +487,14 @@ else
 end
 ```
 
----
-
-## Retain and unretain
+### Retain and unretain
 
 ```lua
 conn:retain({ 'fw', 'version' }, '1.2.3')
 conn:unretain({ 'fw', 'version' })
 ```
 
-A matching future subscription receives retained replay best-effort and bounded by its mailbox.
-
----
-
-## Subscribe
+### Subscribe
 
 ```lua
 local sub = conn:subscribe({ 'fw', '#' })
@@ -566,9 +518,7 @@ local sub = conn:subscribe(
 )
 ```
 
----
-
-## Compose a timeout
+### Compose a timeout
 
 Subscriptions and retained watches do not have built-in timeouts. Compose them externally:
 
@@ -582,17 +532,9 @@ local which, msg, err = fibers.perform(fibers.named_choice{
     return nil, 'timeout'
   end),
 })
-
-if which == 'msg' then
-  -- msg may be nil if closed
-else
-  -- timeout
-end
 ```
 
----
-
-## Watch retained state
+### Watch retained state
 
 ```lua
 local watch = conn:watch_retained({ 'config', '#' }, {
@@ -609,17 +551,17 @@ local ev, err = watch:recv()
 if ev then
   if ev.op == 'retain' then
     print('updated:', ev.payload)
-  else
+  elseif ev.op == 'unretain' then
     print('removed:', table.concat(ev.topic, '/'))
+  elseif ev.op == 'replay_done' then
+    print('initial retained replay complete')
   end
 else
   print('watch closed:', err)
 end
 ```
 
----
-
-## Bind an endpoint and handle requests
+### Bind an endpoint and handle requests
 
 ```lua
 local ep = conn:bind({ 'rpc', 'echo' }, { queue_len = 1 })
@@ -636,15 +578,13 @@ fibers.spawn(function ()
 end)
 ```
 
-A request handler may instead fail explicitly:
+Fail explicitly:
 
 ```lua
 req:fail('not_supported')
 ```
 
----
-
-## Call an endpoint
+### Call an endpoint
 
 ```lua
 local value, err = conn:call({ 'rpc', 'echo' }, 'hello', { timeout = 1.0 })
@@ -658,9 +598,7 @@ end
 
 Point-to-point topics must be concrete. Wildcards are rejected, though literal wildcard tokens wrapped with `Bus.literal(...)` are allowed.
 
----
-
-## Unsubscribe, unwatch, unbind, disconnect
+### Unsubscribe, unwatch, unbind, disconnect
 
 ```lua
 sub:unsubscribe()
@@ -671,17 +609,15 @@ conn:disconnect()
 
 All are intended to be idempotent and to wake blocked receivers promptly.
 
----
-
 ## Authorisation
 
 The bus may be constructed with an optional authoriser.
 
 Supported forms:
 
-* `function(ctx) -> boolean|nil, reason?`
-* table with `:allow(ctx)`
-* table with `:authorize(ctx)`
+- `function(ctx) -> boolean|nil, reason?`
+- table with `:allow(ctx)`
+- table with `:authorize(ctx)`
 
 The authoriser receives a context such as:
 
@@ -697,17 +633,15 @@ The authoriser receives a context such as:
 
 Actions in the simplified API are:
 
-* `publish`
-* `retain`
-* `unretain`
-* `subscribe`
-* `watch_retained`
-* `bind`
-* `call`
+- `publish`
+- `retain`
+- `unretain`
+- `subscribe`
+- `watch_retained`
+- `bind`
+- `call`
 
 If authorisation fails, the attempted operation raises an error.
-
----
 
 ## Stats
 
@@ -737,42 +671,38 @@ If authorisation fails, the attempted operation raises an error.
 }
 ```
 
----
-
 ## Notes and limitations
 
-* Delivery is best-effort and bounded; drops under load are expected.
-* Retained replay to new subscriptions is also bounded and best-effort.
-* Retained-watch replay and live retained events are bounded and best-effort.
-* `full = "block"` is intentionally unsupported.
-* Ordinary subscriptions observe published messages.
-* Retained watches observe retained-state lifecycle.
-* Endpoints carry command requests only; they are not part of ordinary pub/sub.
-* Origin metadata is part of bus semantics, not an application payload convention.
-
----
+- Delivery is best-effort and bounded; drops under load are expected.
+- Retained replay to new subscriptions is bounded and best-effort.
+- Retained-watch replay is bounded; if the bus cannot deliver the terminal `replay_done` marker, the watch is closed.
+- `full = "block"` is intentionally unsupported.
+- Ordinary subscriptions observe published messages.
+- Retained watches observe retained-state lifecycle.
+- Endpoints carry command requests only; they are not part of ordinary pub/sub.
+- Origin metadata is part of bus semantics, not an application payload convention.
 
 ## Design summary
 
-The bus intentionally exposes only two public interaction styles:
+The bus intentionally exposes only two public interaction styles.
 
 ### State/event plane
 
-* `publish`
-* `retain`
-* `unretain`
-* `subscribe`
-* `watch_retained`
+- `publish`
+- `retain`
+- `unretain`
+- `subscribe`
+- `watch_retained`
 
 ### Command plane
 
-* `bind`
-* `call`
+- `bind`
+- `call`
 
 That gives a small, teachable model:
 
-* publish facts,
-* retain current truth,
-* call owned actions,
+- publish facts
+- retain current truth
+- call owned actions
 
 while keeping provenance available for observability, policy, and federation layers such as `fabric`.
