@@ -1,6 +1,6 @@
 -- bus.lua
 --
--- Simplified in-process bus built on fibers + trie.
+-- Simple in-process bus built on fibers + trie.
 --
 -- Public planes:
 --   * state/event plane : publish, retain, unretain, subscribe, watch_retained
