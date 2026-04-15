@@ -1,6 +1,6 @@
 -- bus.lua
 --
--- In-process bus built on fibers + trie.
+-- Simplified in-process bus built on fibers + trie.
 --
 -- Public planes:
 --   * state/event plane : publish, retain, unretain, subscribe, watch_retained
@@ -298,6 +298,8 @@ end
 ---@field generation integer|nil
 ---@field extra table|nil
 
+local Origin = {}
+
 ---@class Message
 ---@field topic Topic
 ---@field payload any
@@ -318,15 +320,15 @@ local function new_msg(topic, payload, origin)
 end
 
 ---@class RetainedEvent
----@field op '"retain"'|'"unretain"'
----@field topic Topic
+---@field op '"retain"'|'"unretain"'|'"replay_done"'
+---@field topic Topic|nil
 ---@field payload any|nil
 ---@field origin Origin|nil
 local RetainedEvent = {}
 RetainedEvent.__index = RetainedEvent
 
----@param op_name '"retain"'|'"unretain"'
----@param topic Topic
+---@param op_name '"retain"'|'"unretain"'|'"replay_done"'
+---@param topic Topic|nil
 ---@param payload? any
 ---@param origin? Origin
 ---@return RetainedEvent
@@ -336,6 +338,18 @@ local function new_retained_event(op_name, topic, payload, origin)
 		topic   = topic,
 		payload = payload,
 		origin  = origin,
+	}, RetainedEvent)
+end
+
+local BUS_ORIGIN = freeze_origin({ kind = 'bus' })
+
+---@return RetainedEvent
+local function new_replay_done_event()
+	return setmetatable({
+		op      = 'replay_done',
+		topic   = nil,
+		payload = nil,
+		origin  = BUS_ORIGIN,
 	}, RetainedEvent)
 end
 
@@ -625,6 +639,17 @@ local function deliver_best_effort(tx, value)
 	op.perform_raw(tx:send_op(value))
 end
 
+local function deliver_required_or_close(tx, value, close_reason)
+	local send_op = tx:send_op(value)
+	local ready, ok, reason = send_op.try_fn()
+	assert(ready, 'required delivery unexpectedly blocked')
+	if ok == true then
+		return true
+	end
+	tx:close(close_reason or reason or 'closed')
+	return false
+end
+
 ---@param conn Connection
 ---@param topic Topic
 ---@param qlen integer
@@ -710,6 +735,13 @@ function Bus:_watch_retained(conn, topic, qlen, full, replay)
 			deliver_best_effort(tx,
 				new_retained_event('retain', retained_msg.topic, retained_msg.payload, retained_msg.origin))
 		end)
+
+		if not deliver_required_or_close(tx, new_replay_done_event(), 'replay_overflow') then
+			watchers[rw] = nil
+			if next(watchers) == nil then
+				self._retained_watchers:delete(topic)
+			end
+		end
 	end
 
 	return rw
@@ -1274,6 +1306,7 @@ return {
 	Endpoint      = Endpoint,
 	Message       = Message,
 	Request       = Request,
+	Origin        = Origin,
 
 	-- Re-export trie literal helper for convenience.
 	literal = trie.literal,
