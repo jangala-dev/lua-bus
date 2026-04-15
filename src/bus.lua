@@ -1,14 +1,18 @@
 -- bus.lua
 --
--- In-process pub/sub bus built on fibers + trie.
---  - wildcard subscriptions (pubsub trie: wildcards allowed in stored keys; literal queries)
---  - retained messages (retained trie: literal stored keys; wildcards allowed in queries)
---  - retained watch feeds (wildcard watch patterns over retain/unretain lifecycle)
---  - request/response helpers (reply_to topic)
+-- In-process bus built on fibers + trie.
 --
--- Optional extensions:
---  - lane B: bind/publish_one/call_op for admission-signalled point-to-point delivery
---  - authz : principal-aware authorisation hooks on connection actions
+-- Public planes:
+--   * state/event plane : publish, retain, unretain, subscribe, watch_retained
+--   * command plane     : bind, call
+--
+-- Key properties:
+--   * wildcard subscriptions (pubsub trie: wildcards allowed in stored keys; literal queries)
+--   * retained messages (retained trie: literal stored keys; wildcards allowed in queries)
+--   * retained watch feeds (wildcard watch patterns over retain/unretain lifecycle)
+--   * bounded endpoint calls with native request/reply (no public reply topics)
+--   * immutable origin metadata attached to delivered bus objects
+--   * principal-aware authorisation hooks on connection actions
 ---@module 'bus'
 
 local mailbox   = require 'fibers.mailbox'
@@ -16,7 +20,7 @@ local op        = require 'fibers.op'
 local performer = require 'fibers.performer'
 local scope_mod = require 'fibers.scope'
 local runtime   = require 'fibers.runtime'
-local wait      = require 'fibers.wait'
+local sleep     = require 'fibers.sleep'
 
 local trie = require 'trie'
 local uuid = require 'uuid'
@@ -162,6 +166,41 @@ local function topic_debug(topic)
 	return table.concat(parts, '/')
 end
 
+local function copy_table(t)
+	local out = {}
+	if not t then return out end
+	for k, v in pairs(t) do out[k] = v end
+	return out
+end
+
+local function freeze_origin(origin)
+	local data = origin
+	return setmetatable({}, {
+		__index = data,
+		__newindex = function () error('origin is immutable', 2) end,
+		__pairs = function () return next, data, nil end,
+		__metatable = false,
+	})
+end
+
+---@param conn Connection
+---@param extra? table
+---@return Origin
+local function build_origin(conn, extra)
+	local base = conn._origin_base or {}
+	local out  = {}
+
+	for k, v in pairs(base) do out[k] = v end
+	if extra then
+		for k, v in pairs(extra) do out[k] = v end
+	end
+
+	if out.kind == nil then out.kind = 'local' end
+	out.conn_id   = conn._conn_id
+	out.principal = conn._principal
+	return freeze_origin(out)
+end
+
 --------------------------------------------------------------------------------
 -- Authorisation
 --------------------------------------------------------------------------------
@@ -246,28 +285,35 @@ local function assert_authorized(self, action, topic, extra, level)
 end
 
 --------------------------------------------------------------------------------
--- Message / retained events
+-- Delivered objects
 --------------------------------------------------------------------------------
+
+---@class Origin
+---@field kind string
+---@field conn_id string|nil
+---@field principal any|nil
+---@field link_id string|nil
+---@field peer_node string|nil
+---@field peer_sid string|nil
+---@field generation integer|nil
+---@field extra table|nil
 
 ---@class Message
 ---@field topic Topic
 ---@field payload any
----@field reply_to Topic|nil
----@field id any|nil
+---@field origin Origin
 local Message = {}
 Message.__index = Message
 
 ---@param topic Topic
 ---@param payload any
----@param reply_to? Topic
----@param id? any
+---@param origin Origin
 ---@return Message
-local function new_msg(topic, payload, reply_to, id)
+local function new_msg(topic, payload, origin)
 	return setmetatable({
-		topic    = topic,
-		payload  = payload,
-		reply_to = reply_to,
-		id       = id,
+		topic   = topic,
+		payload = payload,
+		origin  = origin,
 	}, Message)
 end
 
@@ -275,29 +321,78 @@ end
 ---@field op '"retain"'|'"unretain"'
 ---@field topic Topic
 ---@field payload any|nil
----@field reply_to Topic|nil
----@field id any|nil
+---@field origin Origin|nil
 local RetainedEvent = {}
 RetainedEvent.__index = RetainedEvent
 
 ---@param op_name '"retain"'|'"unretain"'
 ---@param topic Topic
 ---@param payload? any
----@param reply_to? Topic
----@param id? any
+---@param origin? Origin
 ---@return RetainedEvent
-local function new_retained_event(op_name, topic, payload, reply_to, id)
+local function new_retained_event(op_name, topic, payload, origin)
 	return setmetatable({
-		op       = op_name,
-		topic    = topic,
-		payload  = payload,
-		reply_to = reply_to,
-		id       = id,
+		op      = op_name,
+		topic   = topic,
+		payload = payload,
+		origin  = origin,
 	}, RetainedEvent)
 end
 
+---@class Request
+---@field topic Topic
+---@field payload any
+---@field origin Origin
+---@field _reply_tx MailboxTx
+---@field _done boolean
+local Request = {}
+Request.__index = Request
+
+local function request_deliver(self, record)
+	if self._done then return false end
+	self._done = true
+
+	local send_op = self._reply_tx:send_op(record)
+	local ready, ok, reason = send_op.try_fn()
+	assert(ready, 'request reply mailbox unexpectedly blocked')
+	self._reply_tx:close('done')
+	return ok == true and reason == nil
+end
+
+---@param topic Topic
+---@param payload any
+---@param origin Origin
+---@param reply_tx MailboxTx
+---@return Request
+local function new_request(topic, payload, origin, reply_tx)
+	return setmetatable({
+		topic     = topic,
+		payload   = payload,
+		origin    = origin,
+		_reply_tx = reply_tx,
+		_done     = false,
+	}, Request)
+end
+
+---@param value any
+---@return boolean ok
+function Request:reply(value)
+	return request_deliver(self, { ok = true, value = value })
+end
+
+---@param err any
+---@return boolean ok
+function Request:fail(err)
+	return request_deliver(self, { ok = false, err = err })
+end
+
+---@return boolean
+function Request:done()
+	return self._done
+end
+
 --------------------------------------------------------------------------------
--- Subscription (lane A)
+-- Subscription (state/event plane)
 --------------------------------------------------------------------------------
 
 ---@class Subscription
@@ -439,7 +534,7 @@ function RetainedWatch:stats()
 end
 
 --------------------------------------------------------------------------------
--- Endpoint (lane B)
+-- Endpoint (command plane)
 --------------------------------------------------------------------------------
 
 ---@class Endpoint
@@ -482,11 +577,11 @@ end
 
 ---@return Op
 function Endpoint:recv_op()
-	return self._rx:recv_op():wrap(function (msg)
-		if msg == nil then
+	return self._rx:recv_op():wrap(function (req)
+		if req == nil then
 			return nil, tostring(self._rx:why() or 'closed')
 		end
-		return msg, nil
+		return req, nil
 	end)
 end
 
@@ -496,14 +591,6 @@ end
 
 function Endpoint:iter()
 	return self._rx:iter()
-end
-
-function Endpoint:payloads()
-	local it = self._rx:iter()
-	return function ()
-		local msg = it()
-		return msg and msg.payload or nil
-	end
 end
 
 --------------------------------------------------------------------------------
@@ -593,12 +680,12 @@ end
 function Bus:_retain(msg)
 	self:_publish(msg)
 	self._retained:insert(msg.topic, msg)
-	self:_notify_retained(new_retained_event('retain', msg.topic, msg.payload, msg.reply_to, msg.id))
+	self:_notify_retained(new_retained_event('retain', msg.topic, msg.payload, msg.origin))
 end
 
-function Bus:_unretain(topic)
+function Bus:_unretain(topic, origin)
 	self._retained:delete(topic)
-	self:_notify_retained(new_retained_event('unretain', topic))
+	self:_notify_retained(new_retained_event('unretain', topic, nil, origin))
 end
 
 ---@param conn Connection
@@ -621,7 +708,7 @@ function Bus:_watch_retained(conn, topic, qlen, full, replay)
 	if replay then
 		self._retained:each(topic, function (_k, retained_msg)
 			deliver_best_effort(tx,
-				new_retained_event('retain', retained_msg.topic, retained_msg.payload, retained_msg.reply_to, retained_msg.id))
+				new_retained_event('retain', retained_msg.topic, retained_msg.payload, retained_msg.origin))
 		end)
 	end
 
@@ -650,6 +737,8 @@ end
 ---@field _eps table<Endpoint, boolean>
 ---@field _rws table<RetainedWatch, boolean>
 ---@field _disconnected boolean
+---@field _conn_id string
+---@field _origin_base table
 local Connection = {}
 Connection.__index = Connection
 
@@ -659,7 +748,7 @@ local function assert_connected(self, level)
 	end
 end
 
-local function new_connection(bus, principal, q_length, full)
+local function new_connection(bus, principal, q_length, full, origin_base)
 	return setmetatable({
 		_bus          = bus,
 		_principal    = principal,
@@ -669,6 +758,8 @@ local function new_connection(bus, principal, q_length, full)
 		_eps          = {},
 		_rws          = {},
 		_disconnected = false,
+		_conn_id      = tostring(uuid.new()),
+		_origin_base  = copy_table(origin_base),
 	}, Connection)
 end
 
@@ -699,18 +790,12 @@ function Connection:publish(topic, payload, opts)
 	assert_topic(topic, 'topic', 1)
 
 	opts = opts or {}
-	local reply_to = opts.reply_to
-	if reply_to ~= nil then
-		assert_topic(reply_to, 'reply_to', 2)
-	end
-
 	assert_authorized(self, 'publish', topic, {
-		payload  = payload,
-		reply_to = reply_to,
-		id       = opts.id,
+		payload = payload,
+		opts    = opts,
 	}, 1)
 
-	self._bus:_publish(new_msg(topic, payload, reply_to, opts.id))
+	self._bus:_publish(new_msg(topic, payload, build_origin(self, opts.origin)))
 	return true
 end
 
@@ -719,28 +804,25 @@ function Connection:retain(topic, payload, opts)
 	assert_topic(topic, 'topic', 1)
 
 	opts = opts or {}
-	local reply_to = opts.reply_to
-	if reply_to ~= nil then
-		assert_topic(reply_to, 'reply_to', 2)
-	end
-
 	assert_authorized(self, 'retain', topic, {
-		payload  = payload,
-		reply_to = reply_to,
-		id       = opts.id,
+		payload = payload,
+		opts    = opts,
 	}, 1)
 
-	self._bus:_retain(new_msg(topic, payload, reply_to, opts.id))
+	self._bus:_retain(new_msg(topic, payload, build_origin(self, opts.origin)))
 	return true
 end
 
-function Connection:unretain(topic)
+function Connection:unretain(topic, opts)
 	assert_connected(self, 1)
 	assert_topic(topic, 'topic', 1)
 
-	assert_authorized(self, 'unretain', topic, nil, 1)
+	opts = opts or {}
+	assert_authorized(self, 'unretain', topic, {
+		opts = opts,
+	}, 1)
 
-	self._bus:_unretain(topic)
+	self._bus:_unretain(topic, build_origin(self, opts.origin))
 	return true
 end
 
@@ -867,141 +949,6 @@ function Connection:unwatch_retained(rw)
 	return true
 end
 
-function Connection:disconnect()
-	if self._disconnected then return true end
-	self._disconnected = true
-
-	local bus = self._bus
-	self._bus = nil
-
-	local subs = {}
-	for sub in pairs(self._subs) do subs[#subs + 1] = sub end
-	for i = 1, #subs do
-		local sub = subs[i]
-		if sub then
-			sub:_close('disconnected')
-			if sub._detach_finaliser then
-				sub._detach_finaliser()
-				sub._detach_finaliser = nil
-			end
-			if bus then bus:_unsubscribe(sub) end
-			self._subs[sub] = nil
-			if sub._conn == self then sub._conn = nil end
-		end
-	end
-
-	local rws = {}
-	for rw in pairs(self._rws) do rws[#rws + 1] = rw end
-	for i = 1, #rws do
-		local rw = rws[i]
-		if rw then
-			rw:_close('disconnected')
-			if rw._detach_finaliser then
-				rw._detach_finaliser()
-				rw._detach_finaliser = nil
-			end
-			if bus then bus:_unwatch_retained(rw) end
-			self._rws[rw] = nil
-			if rw._conn == self then rw._conn = nil end
-		end
-	end
-
-	local eps = {}
-	for ep in pairs(self._eps) do eps[#eps + 1] = ep end
-	for i = 1, #eps do
-		local ep = eps[i]
-		if ep then
-			if ep._tx then ep._tx:close('disconnected') end
-			if bus and bus._endpoints and bus._endpoints[ep._key] == ep then
-				bus._endpoints[ep._key] = nil
-			end
-			if ep._detach_finaliser then
-				ep._detach_finaliser()
-				ep._detach_finaliser = nil
-			end
-			self._eps[ep] = nil
-			if ep._conn == self then ep._conn = nil end
-		end
-	end
-
-	if bus and bus._conns then bus._conns[self] = nil end
-	return true
-end
-
-function Connection:stats()
-	local nsubs, neps, nrws = 0, 0, 0
-	for _ in pairs(self._subs) do nsubs = nsubs + 1 end
-	for _ in pairs(self._eps) do neps = neps + 1 end
-	for _ in pairs(self._rws) do nrws = nrws + 1 end
-	return {
-		dropped         = self:dropped(),
-		subscriptions   = nsubs,
-		endpoints       = neps,
-		retained_watches = nrws,
-	}
-end
-
---------------------------------------------------------------------------------
--- Request helpers (lane A)
---------------------------------------------------------------------------------
-
-function Connection:request_sub(topic, payload, opts)
-	assert_connected(self, 1)
-	assert_topic(topic, 'topic', 1)
-
-	opts = opts or {}
-	if type(opts) ~= 'table' then
-		error('request_sub: opts must be a table (or nil)', 2)
-	end
-
-	assert_authorized(self, 'request', topic, {
-		payload = payload,
-		opts    = opts,
-	}, 1)
-
-	local reply_to = { uuid.new() }
-	local msg      = new_msg(topic, payload, reply_to)
-
-	local sub = self:_subscribe_internal(reply_to, opts)
-	self._bus:_publish(msg)
-	return sub
-end
-
-function Connection:request_once_op(topic, payload, opts)
-	opts = opts or {}
-	if type(opts) ~= 'table' then
-		error('request_once_op: opts must be a table (or nil)', 2)
-	end
-
-	return op.guard(function ()
-		assert_connected(self, 1)
-		assert_topic(topic, 'topic', 1)
-
-		assert_authorized(self, 'request', topic, {
-			payload = payload,
-			opts    = opts,
-		}, 1)
-
-		local reply_to = { uuid.new() }
-		local msg      = new_msg(topic, payload, reply_to)
-
-		return op.bracket(
-			function ()
-				return self:_subscribe_internal(reply_to, { queue_len = 1, full = 'reject_newest' })
-			end,
-			function (sub) sub:unsubscribe() end,
-			function (sub)
-				self._bus:_publish(msg)
-				return sub:recv_op()
-			end
-		)
-	end)
-end
-
---------------------------------------------------------------------------------
--- Lane B: endpoints + publish_one + call_op (opt-in)
---------------------------------------------------------------------------------
-
 ---@param topic Topic
 ---@param opts? table
 ---@return Endpoint
@@ -1074,49 +1021,29 @@ function Connection:unbind(ep)
 	return true
 end
 
-function Connection:publish_one_op(topic, payload, opts)
-	opts = opts or {}
-	if type(opts) ~= 'table' then
-		error('publish_one_op: opts must be a table (or nil)', 2)
+local function call_result_op(reply_rx, reply_tx, deadline)
+	local now = runtime.now()
+	if deadline <= now then
+		reply_tx:close('timeout')
+		return op.always(nil, 'timeout')
 	end
 
-	return op.guard(function ()
-		assert_connected(self, 1)
-		assert_topic(topic, 'topic', 1)
-
-		assert_authorized(self, 'publish_one', topic, {
-			payload  = payload,
-			reply_to = opts.reply_to,
-			id       = opts.id,
-		}, 1)
-
-		local bus = assert(self._bus)
-		assert_concrete_topic(bus._s_wild, bus._m_wild, topic, 'publish_one topic', 2)
-
-		local reply_to = opts.reply_to
-		if reply_to ~= nil then
-			assert_topic(reply_to, 'reply_to', 2)
-			assert_concrete_topic(bus._s_wild, bus._m_wild, reply_to, 'reply_to', 2)
-		end
-
-		local key = topic_key(topic)
-		local ep  = bus._endpoints[key]
-		if not ep or not ep._tx then
-			return op.always(false, 'no_route')
-		end
-
-		local msg = new_msg(topic, payload, reply_to, opts.id)
-
-		return ep._tx:send_op(msg):wrap(function (ok, reason)
-			if ok == true then return true, nil end
-			if ok == nil then return false, 'closed' end
-			return false, reason or 'full'
-		end)
+	local timeout_ev = sleep.sleep_op(deadline - now):wrap(function ()
+		reply_tx:close('timeout')
+		return nil, 'timeout'
 	end)
-end
 
-function Connection:publish_one(topic, payload, opts)
-	return perform(self:publish_one_op(topic, payload, opts))
+	local reply_ev = reply_rx:recv_op():wrap(function (reply)
+		if reply == nil then
+			return nil, tostring(reply_rx:why() or 'closed')
+		end
+		if reply.ok then
+			return reply.value, nil
+		end
+		return nil, reply.err
+	end)
+
+	return op.choice(reply_ev, timeout_ev)
 end
 
 function Connection:call_op(topic, payload, opts)
@@ -1137,162 +1064,51 @@ function Connection:call_op(topic, payload, opts)
 		local bus = assert(self._bus)
 		assert_concrete_topic(bus._s_wild, bus._m_wild, topic, 'call topic', 2)
 
-		local timeout     = (type(opts.timeout) == 'number') and opts.timeout or 1.0
-		local deadline    = (type(opts.deadline) == 'number') and opts.deadline or (runtime.now() + timeout)
-		local backoff     = (type(opts.backoff) == 'number') and opts.backoff or 0.01
-		local backoff_max = (type(opts.backoff_max) == 'number') and opts.backoff_max or 0.2
+		local key = topic_key(topic)
+		local ep  = bus._endpoints[key]
+		if not ep or not ep._tx then
+			return op.always(nil, 'no_route')
+		end
 
-		local request_id  = (opts.request_id ~= nil) and opts.request_id or uuid.new()
-		local reply_topic = { request_id }
+		local timeout  = (type(opts.timeout) == 'number') and opts.timeout or 1.0
+		local deadline = (type(opts.deadline) == 'number') and opts.deadline or (runtime.now() + timeout)
+		local origin   = build_origin(self, opts.origin)
 
 		return op.bracket(
 			function ()
-				return self:_bind_internal(reply_topic, { queue_len = 1 })
+				local reply_tx, reply_rx = mailbox.new(1, { full = 'reject_newest' })
+				local req = new_request(topic, payload, origin, reply_tx)
+
+				local send_op = ep._tx:send_op(req)
+				local ready, ok, reason = send_op.try_fn()
+				assert(ready, 'endpoint admission unexpectedly blocked')
+
+				if ok ~= true then
+					reply_tx:close(reason or 'closed')
+					return {
+						accepted = false,
+						err      = (ok == nil) and 'closed' or (reason or 'full'),
+						reply_tx = reply_tx,
+						reply_rx = reply_rx,
+					}
+				end
+
+				return {
+					accepted = true,
+					reply_tx = reply_tx,
+					reply_rx = reply_rx,
+				}
 			end,
-			function (rep_ep)
-				if rep_ep then pcall(function () rep_ep:unbind() end) end
+			function (res)
+				if res and res.reply_tx then
+					res.reply_tx:close('done')
+				end
 			end,
-			function (rep_ep)
-				local phase    = 'publish'
-				local next_try = runtime.now()
-				local b        = backoff
-
-				local callee_key = topic_key(topic)
-
-				local function reply_buffered()
-					local rx = rep_ep and rep_ep._rx
-					local st = rx and rx._st
-					local buf = st and st.buf
-					return (buf and buf:length() > 0) or false
+			function (res)
+				if not res.accepted then
+					return op.always(nil, res.err)
 				end
-
-				local function reply_closed()
-					local rx = rep_ep and rep_ep._rx
-					local st = rx and rx._st
-					return (not st) or st.closed or false
-				end
-
-				local function try_publish_once()
-					local ep = bus._endpoints and bus._endpoints[callee_key] or nil
-					if not ep or not ep._tx then
-						return false, 'no_route'
-					end
-
-					local msg = new_msg(topic, payload, reply_topic, request_id)
-
-					local send_op = ep._tx:send_op(msg)
-					local r1, r2, r3 = send_op.try_fn()
-
-					if not r1 then
-						return false, 'would_block'
-					end
-					if r2 == true then return true, nil end
-					if r2 == nil then return false, 'closed' end
-					return false, r3 or 'full'
-				end
-
-				local function try_recv_reply()
-					local rxop = rep_ep._rx:recv_op()
-					local ready, v = rxop.try_fn()
-					if not ready then
-						return false, nil, nil
-					end
-					if v == nil then
-						return true, nil, 'closed'
-					end
-					return true, v.payload, nil
-				end
-
-				local function probe_step()
-					local now = runtime.now()
-					if now >= deadline then
-						return true, function () return nil, 'timeout' end
-					end
-
-					if phase == 'wait_reply' and reply_buffered() then
-						return false, 'run'
-					end
-
-					if phase == 'wait_reply' and reply_closed() and not reply_buffered() then
-						return true, function () return nil, 'closed' end
-					end
-
-					if phase == 'publish' then
-						if now >= next_try then
-							return false, 'run'
-						end
-						return false, 'timer'
-					end
-
-					return false, 'any'
-				end
-
-				local function run_step()
-					local now = runtime.now()
-					if now >= deadline then
-						return true, function () return nil, 'timeout' end
-					end
-
-					if phase == 'publish' then
-						if now < next_try then
-							return false, 'timer'
-						end
-
-						local ok_pub, reason = try_publish_once()
-						if ok_pub then
-							phase = 'wait_reply'
-						else
-							if reason ~= 'full' and reason ~= 'no_route' and reason ~= 'closed' then
-								return true, function () return nil, tostring(reason) end
-							end
-
-							local remaining = deadline - runtime.now()
-							local dt = math.min(b, backoff_max, remaining)
-							if dt <= 0 then
-								return true, function () return nil, 'timeout' end
-							end
-
-							next_try = runtime.now() + dt
-							b = math.min(b * 2, backoff_max)
-							return false, 'timer'
-						end
-					end
-
-					local have, payload_out, err = try_recv_reply()
-					if have then
-						if err ~= nil then
-							return true, function () return nil, err end
-						end
-						return true, function () return payload_out, nil end
-					end
-
-					return false, 'any'
-				end
-
-				---@param task Task
-				---@param waker table
-				---@param want any
-				local function register(task, waker, want)
-					waker:at_time(deadline, task)
-
-					if want == 'run' then
-						waker:wakeup(task)
-						return { unlink = function () return false end }
-					end
-
-					if want == 'timer' then
-						waker:at_time(next_try, task)
-						return { unlink = function () return false end }
-					end
-
-					local tok = rep_ep._rx:on_message(task, waker)
-					return tok or { unlink = function () return false end }
-				end
-
-				return wait.waitable2(register, probe_step, run_step)
-					:wrap(function (th)
-						return th()
-					end)
+				return call_result_op(res.reply_rx, res.reply_tx, deadline)
 			end
 		)
 	end)
@@ -1300,6 +1116,80 @@ end
 
 function Connection:call(topic, payload, opts)
 	return perform(self:call_op(topic, payload, opts))
+end
+
+function Connection:disconnect()
+	if self._disconnected then return true end
+	self._disconnected = true
+
+	local bus = self._bus
+	self._bus = nil
+
+	local subs = {}
+	for sub in pairs(self._subs) do subs[#subs + 1] = sub end
+	for i = 1, #subs do
+		local sub = subs[i]
+		if sub then
+			sub:_close('disconnected')
+			if sub._detach_finaliser then
+				sub._detach_finaliser()
+				sub._detach_finaliser = nil
+			end
+			if bus then bus:_unsubscribe(sub) end
+			self._subs[sub] = nil
+			if sub._conn == self then sub._conn = nil end
+		end
+	end
+
+	local rws = {}
+	for rw in pairs(self._rws) do rws[#rws + 1] = rw end
+	for i = 1, #rws do
+		local rw = rws[i]
+		if rw then
+			rw:_close('disconnected')
+			if rw._detach_finaliser then
+				rw._detach_finaliser()
+				rw._detach_finaliser = nil
+			end
+			if bus then bus:_unwatch_retained(rw) end
+			self._rws[rw] = nil
+			if rw._conn == self then rw._conn = nil end
+		end
+	end
+
+	local eps = {}
+	for ep in pairs(self._eps) do eps[#eps + 1] = ep end
+	for i = 1, #eps do
+		local ep = eps[i]
+		if ep then
+			if ep._tx then ep._tx:close('disconnected') end
+			if bus and bus._endpoints and bus._endpoints[ep._key] == ep then
+				bus._endpoints[ep._key] = nil
+			end
+			if ep._detach_finaliser then
+				ep._detach_finaliser()
+				ep._detach_finaliser = nil
+			end
+			self._eps[ep] = nil
+			if ep._conn == self then ep._conn = nil end
+		end
+	end
+
+	if bus and bus._conns then bus._conns[self] = nil end
+	return true
+end
+
+function Connection:stats()
+	local nsubs, neps, nrws = 0, 0, 0
+	for _ in pairs(self._subs) do nsubs = nsubs + 1 end
+	for _ in pairs(self._eps) do neps = neps + 1 end
+	for _ in pairs(self._rws) do nrws = nrws + 1 end
+	return {
+		dropped          = self:dropped(),
+		subscriptions    = nsubs,
+		endpoints        = neps,
+		retained_watches = nrws,
+	}
 end
 
 --------------------------------------------------------------------------------
@@ -1313,19 +1203,20 @@ function Bus:connect(opts)
 	end
 
 	local s = scope_mod.current()
-	local conn = new_connection(self, opts.principal, self._q_length, self._full)
+	local conn = new_connection(self, opts.principal, self._q_length, self._full, opts.origin_base)
 	self._conns[conn] = true
 	s:finally(function () conn:disconnect() end)
 	return conn
 end
 
 function Bus:stats()
-	local connections, dropped = 0, 0
+	local connections, dropped, endpoints = 0, 0, 0
 	local retained_watches = 0
 	for conn in pairs(self._conns) do
 		connections = connections + 1
 		dropped = dropped + conn:dropped()
 		for _ in pairs(conn._rws or {}) do retained_watches = retained_watches + 1 end
+		for _ in pairs(conn._eps or {}) do endpoints = endpoints + 1 end
 	end
 	return {
 		connections      = connections,
@@ -1335,6 +1226,7 @@ function Bus:stats()
 		s_wild           = self._s_wild,
 		m_wild           = self._m_wild,
 		retained_watches = retained_watches,
+		endpoints        = endpoints,
 	}
 end
 
@@ -1381,6 +1273,7 @@ return {
 	RetainedEvent = RetainedEvent,
 	Endpoint      = Endpoint,
 	Message       = Message,
+	Request       = Request,
 
 	-- Re-export trie literal helper for convenience.
 	literal = trie.literal,
