@@ -62,6 +62,19 @@ local function assert_bus_replay_done(ev)
 	assert_origin_immutable(ev.origin)
 end
 
+local function assert_origin_fields(origin, expected)
+	assert(type(origin) == 'table', 'expected origin table')
+	for k, v in pairs(expected) do
+		assert_eq(origin[k], v, 'unexpected origin field ' .. tostring(k))
+	end
+end
+
+local function assert_origin_extra_immutable(origin)
+	assert(type(origin.extra) == 'table', 'expected origin.extra table')
+	local ok = pcall(function () origin.extra.changed = true end)
+	assert(not ok, 'expected origin.extra to be immutable')
+end
+
 -- A standard “deadline arm”: returns (nil, 'timeout').
 local function timeout_op(dt)
 	return Sleep.sleep_op(dt):wrap(function ()
@@ -627,7 +640,6 @@ local function test_retained_watch_bounded_queue()
 	print('Retained watch (bounded queue) test passed!')
 end
 
-
 local function test_retained_watch_replay_done_empty()
 	local bus  = Bus.new({ m_wild = '#', s_wild = '+' })
 	local conn = bus:connect()
@@ -676,6 +688,299 @@ local function test_retained_watch_replay_overflow_closes_watch()
 	assert_eq(err2, 'replay_overflow')
 
 	print('Retained watch replay overflow test passed!')
+end
+
+--------------------------------------------------------------------------------
+-- Additional origin / provenance tests
+--------------------------------------------------------------------------------
+
+local function test_origin_factory_function_and_extra_on_publish()
+	local bus    = Bus.new({ m_wild = '#', s_wild = '+' })
+	local pub_pr = admin_principal('origin-pub')
+	local seq    = 0
+
+	local conn = bus:connect({
+		principal = pub_pr,
+		origin_factory = function ()
+			seq = seq + 1
+			return {
+				link_id    = 'link-pub',
+				peer_node  = 'peer-pub',
+				peer_sid   = 'sid-pub',
+				generation = seq,
+			}
+		end,
+	})
+
+	local sub = conn:subscribe({ 'origin', 'publish' }, { queue_len = 10 })
+
+	conn:publish({ 'origin', 'publish' }, 'one', {
+		extra = {
+			note    = 'n1',
+			kind    = 'spoof-attempt',
+			link_id = 'fake-link',
+		},
+	})
+
+	conn:publish({ 'origin', 'publish' }, 'two')
+
+	do
+		local msg, err = fibers.perform(sub:recv_op())
+		assert(err == nil and msg, tostring(err))
+		assert_eq(msg.payload, 'one')
+
+		assert_local_origin(msg.origin, pub_pr)
+		assert_origin_fields(msg.origin, {
+			link_id    = 'link-pub',
+			peer_node  = 'peer-pub',
+			peer_sid   = 'sid-pub',
+			generation = 1,
+		})
+
+		assert(type(msg.origin.extra) == 'table', 'expected origin.extra')
+		assert_eq(msg.origin.extra.note, 'n1')
+		assert_eq(msg.origin.extra.kind, 'spoof-attempt')
+		assert_eq(msg.origin.extra.link_id, 'fake-link')
+
+		assert_origin_immutable(msg.origin)
+		assert_origin_extra_immutable(msg.origin)
+	end
+
+	do
+		local msg, err = fibers.perform(sub:recv_op())
+		assert(err == nil and msg, tostring(err))
+		assert_eq(msg.payload, 'two')
+
+		assert_local_origin(msg.origin, pub_pr)
+		assert_origin_fields(msg.origin, {
+			link_id    = 'link-pub',
+			peer_node  = 'peer-pub',
+			peer_sid   = 'sid-pub',
+			generation = 2,
+		})
+
+		assert(msg.origin.extra == nil, 'expected no origin.extra on second publish')
+	end
+
+	print('Origin factory function + extra on publish test passed!')
+end
+
+local function test_origin_conn_ids_distinct_between_connections()
+	local bus   = Bus.new({ m_wild = '#', s_wild = '+' })
+	local sink  = bus:connect()
+	local sub   = sink:subscribe({ 'origin', 'connid' }, { queue_len = 10 })
+
+	local p1 = admin_principal('c1')
+	local p2 = admin_principal('c2')
+
+	local c1 = bus:connect({ principal = p1 })
+	local c2 = bus:connect({ principal = p2 })
+
+	c1:publish({ 'origin', 'connid' }, 'm1')
+	c2:publish({ 'origin', 'connid' }, 'm2')
+
+	local m1, e1 = fibers.perform(sub:recv_op())
+	local m2, e2 = fibers.perform(sub:recv_op())
+
+	assert(e1 == nil and m1, tostring(e1))
+	assert(e2 == nil and m2, tostring(e2))
+
+	assert_local_origin(m1.origin, p1)
+	assert_local_origin(m2.origin, p2)
+
+	assert(m1.origin.conn_id ~= nil, 'expected conn_id on first origin')
+	assert(m2.origin.conn_id ~= nil, 'expected conn_id on second origin')
+	assert(m1.origin.conn_id ~= m2.origin.conn_id, 'expected distinct conn_id values')
+
+	print('Origin conn_id distinctness test passed!')
+end
+
+local function test_retained_replay_preserves_original_origin()
+	local bus = Bus.new({ m_wild = '#', s_wild = '+' })
+
+	local source = bus:connect({
+		principal = admin_principal('ret-source'),
+		origin_factory = {
+			kind       = 'fabric_import',
+			link_id    = 'link-ret',
+			peer_node  = 'peer-ret',
+			peer_sid   = 'sid-ret',
+			generation = 17,
+		},
+	})
+
+	source:retain({ 'origin', 'retained' }, 'R1', {
+		extra = { trace = 'retain-trace' },
+	})
+
+	local sub = bus:connect():subscribe({ 'origin', 'retained' })
+	do
+		local msg, err = fibers.perform(sub:recv_op())
+		assert(err == nil and msg, tostring(err))
+		assert_eq(msg.payload, 'R1')
+
+		assert_origin_fields(msg.origin, {
+			kind       = 'fabric_import',
+			link_id    = 'link-ret',
+			peer_node  = 'peer-ret',
+			peer_sid   = 'sid-ret',
+			generation = 17,
+		})
+		assert_eq(msg.origin.extra.trace, 'retain-trace')
+		assert_origin_immutable(msg.origin)
+		assert_origin_extra_immutable(msg.origin)
+	end
+
+	local rw = bus:connect():watch_retained({ 'origin', 'retained' }, {
+		queue_len = 4,
+		full      = 'reject_newest',
+		replay    = true,
+	})
+
+	do
+		local ev, err = fibers.perform(rw:recv_op())
+		assert(err == nil and ev, tostring(err))
+		assert_eq(ev.op, 'retain')
+		assert_eq(ev.payload, 'R1')
+
+		assert_origin_fields(ev.origin, {
+			kind       = 'fabric_import',
+			link_id    = 'link-ret',
+			peer_node  = 'peer-ret',
+			peer_sid   = 'sid-ret',
+			generation = 17,
+		})
+		assert_eq(ev.origin.extra.trace, 'retain-trace')
+	end
+
+	do
+		local ev, err = fibers.perform(rw:recv_op())
+		assert(err == nil and ev, tostring(err))
+		assert_bus_replay_done(ev)
+	end
+
+	rw:unwatch()
+
+	print('Retained replay preserves original origin test passed!')
+end
+
+local function test_unretain_event_origin_metadata()
+	local bus = Bus.new({ m_wild = '#', s_wild = '+' })
+	local pr  = admin_principal('origin-unretain')
+
+	local conn = bus:connect({
+		principal = pr,
+		origin_factory = {
+			link_id    = 'link-unretain',
+			peer_node  = 'peer-unretain',
+			peer_sid   = 'sid-unretain',
+			generation = 33,
+		},
+	})
+
+	local rw = conn:watch_retained({ 'origin', 'gone' }, {
+		queue_len = 4,
+		full      = 'reject_newest',
+		replay    = false,
+	})
+
+	conn:retain({ 'origin', 'gone' }, 'value')
+	do
+		local ev, err = fibers.perform(rw:recv_op())
+		assert(err == nil and ev and ev.op == 'retain', tostring(err))
+	end
+
+	conn:unretain({ 'origin', 'gone' }, {
+		extra = {
+			reason     = 'manual-clear',
+			generation = 'fake-generation',
+		},
+	})
+
+	do
+		local ev, err = fibers.perform(rw:recv_op())
+		assert(err == nil and ev, tostring(err))
+		assert_eq(ev.op, 'unretain')
+		assert_eq(topic_str(ev.topic), 'origin/gone')
+		assert(ev.payload == nil, 'expected nil payload on unretain')
+
+		assert_local_origin(ev.origin, pr)
+		assert_origin_fields(ev.origin, {
+			link_id    = 'link-unretain',
+			peer_node  = 'peer-unretain',
+			peer_sid   = 'sid-unretain',
+			generation = 33,
+		})
+		assert_eq(ev.origin.extra.reason, 'manual-clear')
+		assert_eq(ev.origin.extra.generation, 'fake-generation')
+
+		assert_origin_immutable(ev.origin)
+		assert_origin_extra_immutable(ev.origin)
+	end
+
+	rw:unwatch()
+
+	print('Unretain event origin metadata test passed!')
+end
+
+local function test_call_request_origin_factory_and_extra()
+	local bus       = Bus.new({ m_wild = '#', s_wild = '+' })
+	local server    = bus:connect({ principal = admin_principal('rpc-server') })
+	local caller_pr = admin_principal('rpc-caller')
+
+	local client = bus:connect({
+		principal = caller_pr,
+		origin_factory = function ()
+			return {
+				link_id    = 'link-call',
+				peer_node  = 'peer-call',
+				peer_sid   = 'sid-call',
+				generation = 44,
+			}
+		end,
+	})
+
+	local ep = server:bind({ 'origin', 'rpc' }, { queue_len = 1 })
+
+	fibers.spawn(function ()
+		local req, err = ep:recv()
+		assert(req, tostring(err))
+
+		assert_eq(topic_str(req.topic), 'origin/rpc')
+		assert_eq(req.payload, 'ping')
+
+		assert_local_origin(req.origin, caller_pr)
+		assert_origin_fields(req.origin, {
+			link_id    = 'link-call',
+			peer_node  = 'peer-call',
+			peer_sid   = 'sid-call',
+			generation = 44,
+		})
+
+		assert(type(req.origin.extra) == 'table', 'expected origin.extra on request')
+		assert_eq(req.origin.extra.note, 'rpc-extra')
+		assert_eq(req.origin.extra.link_id, 'fake-link')
+
+		assert_origin_immutable(req.origin)
+		assert_origin_extra_immutable(req.origin)
+
+		assert(req:reply('pong'))
+	end)
+
+	local reply, err = client:call({ 'origin', 'rpc' }, 'ping', {
+		timeout = LONG_TMO,
+		extra   = {
+			note    = 'rpc-extra',
+			link_id = 'fake-link',
+		},
+	})
+
+	assert(err == nil, tostring(err))
+	assert_eq(reply, 'pong')
+
+	ep:unbind()
+
+	print('Call request origin factory + extra test passed!')
 end
 
 --------------------------------------------------------------------------------
@@ -1315,6 +1620,12 @@ fibers.run(function ()
 	test_retained_watch_bounded_queue()
 	test_retained_watch_replay_done_empty()
 	test_retained_watch_replay_overflow_closes_watch()
+
+	test_origin_factory_function_and_extra_on_publish()
+	test_origin_conn_ids_distinct_between_connections()
+	test_retained_replay_preserves_original_origin()
+	test_unretain_event_origin_metadata()
+	test_call_request_origin_factory_and_extra()
 
 	test_q_overflow_drop_oldest_default()
 	test_q_overflow_reject_newest_override()
