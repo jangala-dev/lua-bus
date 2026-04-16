@@ -984,6 +984,188 @@ local function test_call_request_origin_factory_and_extra()
 end
 
 --------------------------------------------------------------------------------
+-- Derive tests
+--------------------------------------------------------------------------------
+
+local function test_derive_inherits_principal_but_not_origin_factory()
+	local bus       = Bus.new({ m_wild = '#', s_wild = '+' })
+	local principal = admin_principal('derive-base')
+	local seq       = 0
+
+	local base = bus:connect({
+		principal = principal,
+		origin_factory = function ()
+			seq = seq + 1
+			return {
+				kind       = 'fabric_import',
+				link_id    = 'link-base',
+				peer_node  = 'peer-base',
+				peer_sid   = 'sid-base',
+				generation = seq,
+			}
+		end,
+	})
+
+	local sink = bus:connect()
+	local sub  = sink:subscribe({ 'derive', 'inherit' }, { queue_len = 4 })
+	local child = base:derive()
+
+	assert(child:principal() == principal, 'expected derived principal to inherit')
+
+	child:publish({ 'derive', 'inherit' }, 'ok')
+
+	local msg, err = fibers.perform(sub:recv_op())
+	assert(err == nil and msg, tostring(err))
+	assert_eq(msg.payload, 'ok')
+	assert_local_origin(msg.origin, principal)
+	assert(msg.origin.link_id == nil, 'expected origin_factory not to be inherited')
+	assert(msg.origin.peer_node == nil, 'expected origin_factory not to be inherited')
+	assert(msg.origin.peer_sid == nil, 'expected origin_factory not to be inherited')
+	assert(msg.origin.generation == nil, 'expected origin_factory not to be inherited')
+
+	print('Derive inherits principal but not origin_factory test passed!')
+end
+
+local function test_derive_allows_override_principal_and_origin_factory()
+	local bus   = Bus.new({ m_wild = '#', s_wild = '+' })
+	local base  = bus:connect({ principal = admin_principal('parent') })
+	local child_pr = admin_principal('child')
+	local sink  = bus:connect()
+	local sub   = sink:subscribe({ 'derive', 'override' }, { queue_len = 4 })
+
+	local child = base:derive({
+		principal = child_pr,
+		origin_factory = {
+			kind       = 'fabric_import',
+			link_id    = 'link-child',
+			peer_node  = 'peer-child',
+			peer_sid   = 'sid-child',
+			generation = 7,
+		},
+	})
+
+	child:publish({ 'derive', 'override' }, 'payload', {
+		extra = { marker = 'x' },
+	})
+
+	local msg, err = fibers.perform(sub:recv_op())
+	assert(err == nil and msg, tostring(err))
+	assert_eq(msg.payload, 'payload')
+	assert_origin_fields(msg.origin, {
+		kind       = 'fabric_import',
+		link_id    = 'link-child',
+		peer_node  = 'peer-child',
+		peer_sid   = 'sid-child',
+		generation = 7,
+		principal  = child_pr,
+	})
+	assert_eq(msg.origin.extra.marker, 'x')
+
+	print('Derive override principal and origin_factory test passed!')
+end
+
+local function test_derive_disconnected_errors()
+	local bus  = Bus.new({ m_wild = '#', s_wild = '+' })
+	local conn = bus:connect()
+	conn:disconnect()
+
+	local ok = pcall(function ()
+		conn:derive()
+	end)
+	assert(not ok, 'expected derive on disconnected connection to error')
+
+	print('Derive on disconnected connection test passed!')
+end
+
+local function test_derive_connection_scope_cleanup()
+	local bus = Bus.new({ m_wild = '#', s_wild = '+' })
+	local outer = bus:connect()
+	local sub = outer:subscribe({ 'derive', 'scope' }, { queue_len = 4 })
+
+	local st, rep = fibers.run_scope(function (s)
+		local parent = bus:connect({ principal = admin_principal('scoped-parent') })
+		local child  = parent:derive()
+		child:publish({ 'derive', 'scope' }, 'before')
+		Sleep.sleep(TMO)
+	end)
+
+	assert_eq(st, 'ok', 'expected scoped run to complete')
+	assert(rep ~= nil, 'expected scope report')
+
+	do
+		local msg, err = fibers.perform(sub:recv_op())
+		assert(err == nil and msg, tostring(err))
+		assert_eq(msg.payload, 'before')
+	end
+
+	local stats = bus:stats()
+	assert_eq(stats.connections, 1, 'expected only outer connection to remain after scoped cleanup')
+
+	print('Derive connection scope cleanup test passed!')
+end
+
+--------------------------------------------------------------------------------
+-- Request lifecycle tests
+--------------------------------------------------------------------------------
+
+local function test_request_abandon_after_timeout_rejects_late_reply()
+	local bus    = Bus.new({ m_wild = '#', s_wild = '+' })
+	local server = bus:connect()
+	local client = bus:connect()
+
+	local ep = server:bind({ 'rpc', 'abandon' }, { queue_len = 1 })
+	local late = Channel.new(1)
+
+	fibers.spawn(function ()
+		local req, err = ep:recv()
+		assert(req, tostring(err))
+		Sleep.sleep(LONG_TMO)
+		late:put(req:reply('too-late'))
+	end)
+
+	local reply, err = client:call({ 'rpc', 'abandon' }, 'x', { timeout = TMO })
+	assert(reply == nil)
+	assert_eq(err, 'timeout')
+
+	local which, ok, cherr = select_named({
+		late     = late:get_op():wrap(function (v) return v, nil end),
+		deadline = timeout_op(LONG_TMO),
+	})
+	assert_eq(which, 'late')
+	assert(cherr == nil)
+	assert_eq(ok, false)
+
+	print('Request abandon after timeout rejects late reply test passed!')
+end
+
+local function test_request_done_state_for_fail_and_abandon()
+	local req = Bus.Request and Bus.Request or error('Bus.Request missing')
+	local origin = setmetatable({}, { __index = { kind = 'local' }, __newindex = function () error('immutable') end })
+	local r = req.__index and nil
+	-- Use the real command plane instead of constructing Request internals directly.
+	local bus    = Bus.new({ m_wild = '#', s_wild = '+' })
+	local server = bus:connect()
+	local client = bus:connect()
+
+	local ep = server:bind({ 'rpc', 'done' }, { queue_len = 1 })
+	fibers.spawn(function ()
+		local request, err = ep:recv()
+		assert(request, tostring(err))
+		assert(not request:done(), 'request should not be done initially')
+		assert(request:fail('failed-now'))
+		assert(request:done(), 'request should be done after fail')
+		assert(request:abandon('later') == false, 'abandon after fail should return false')
+		assert(request:reply('later') == false, 'reply after fail should return false')
+	end)
+
+	local value, err = client:call({ 'rpc', 'done' }, 'x', { timeout = LONG_TMO })
+	assert(value == nil)
+	assert_eq(err, 'failed-now')
+
+	print('Request done state for fail/abandon test passed!')
+end
+
+--------------------------------------------------------------------------------
 -- Unsubscribe Test
 --------------------------------------------------------------------------------
 
@@ -1498,6 +1680,11 @@ local function test_authz_denies_without_admin_role()
 	assert(not ok5, 'expected watch_retained without admin role to be denied')
 	assert(tostring(err5):match('permission denied'), tostring(err5))
 
+	local ok6, err6 = pcall(function()
+		conn_viewer:derive()
+	end)
+	assert(ok6, 'expected derive itself not to be authoriser-gated: ' .. tostring(err6))
+
 	print('Authz deny test passed!')
 end
 
@@ -1626,6 +1813,14 @@ fibers.run(function ()
 	test_retained_replay_preserves_original_origin()
 	test_unretain_event_origin_metadata()
 	test_call_request_origin_factory_and_extra()
+
+	test_derive_inherits_principal_but_not_origin_factory()
+	test_derive_allows_override_principal_and_origin_factory()
+	test_derive_disconnected_errors()
+	test_derive_connection_scope_cleanup()
+
+	test_request_abandon_after_timeout_rejects_late_reply()
+	test_request_done_state_for_fail_and_abandon()
 
 	test_q_overflow_drop_oldest_default()
 	test_q_overflow_reject_newest_override()

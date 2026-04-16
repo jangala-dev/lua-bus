@@ -838,6 +838,20 @@ function Connection:principal()
 	return self._principal
 end
 
+---@param opts? { principal?: any, origin_factory?: table|fun():table, origin_base?: table|fun():table }
+---@return Connection
+function Connection:derive(opts)
+	assert_connected(self, 1)
+	opts = require_opts_table('derive', opts, 2)
+
+	local bus = assert(self._bus)
+	if opts.principal == nil then
+		opts.principal = self._principal
+	end
+
+	return bus:connect(opts)
+end
+
 function Connection:dropped()
 	local n = 0
 	for _, set in ipairs({ self._subs, self._eps, self._rws }) do
