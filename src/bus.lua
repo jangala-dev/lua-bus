@@ -10,6 +10,7 @@
 --   * wildcard subscriptions (pubsub trie: wildcards allowed in stored keys; literal queries)
 --   * retained messages (retained trie: literal stored keys; wildcards allowed in queries)
 --   * retained watch feeds (wildcard watch patterns over retain/unretain lifecycle)
+--   * retained materialised views for event-driven assertions/observation
 --   * bounded endpoint calls with native request/reply (no public reply topics)
 --   * immutable origin metadata attached to delivered bus objects
 --   * trusted provenance is bus-owned; callers may attach only origin.extra
@@ -131,6 +132,7 @@ end
 local function assert_concrete_topic(s_wild, m_wild, topic, what, level)
 	level = (level or 1) + 1
 	local n = array_len(topic, level)
+
 	for i = 1, n do
 		local raw, was_lit = unwrap_token(topic[i])
 		if not was_lit and (raw == s_wild or raw == m_wild) then
@@ -144,6 +146,7 @@ end
 local function topic_key(topic)
 	local n = array_len(topic, 3)
 	local parts = {}
+
 	for i = 1, n do
 		local raw = unwrap_token(topic[i])
 		if type(raw) == 'string' then
@@ -153,6 +156,7 @@ local function topic_key(topic)
 			parts[#parts + 1] = 'n' .. #s .. ':' .. s
 		end
 	end
+
 	return table.concat(parts, '|')
 end
 
@@ -161,22 +165,29 @@ end
 local function topic_debug(topic)
 	local n = array_len(topic, 3)
 	local parts = {}
+
 	for i = 1, n do
 		local raw, was_lit = unwrap_token(topic[i])
 		parts[i] = was_lit and ('=' .. tostring(raw)) or tostring(raw)
 	end
+
 	return table.concat(parts, '/')
 end
 
 local function copy_table(t)
 	local out = {}
 	if not t then return out end
-	for k, v in pairs(t) do out[k] = v end
+
+	for k, v in pairs(t) do
+		out[k] = v
+	end
+
 	return out
 end
 
 local function freeze_shallow(t, err)
 	local data = t or {}
+
 	return setmetatable({}, {
 		__index     = data,
 		__newindex  = function () error(err or 'table is immutable', 2) end,
@@ -192,7 +203,9 @@ end
 local function mailbox_try_send(tx, value)
 	local send_op = tx:send_op(value)
 	local ready, ok, reason = send_op.try_fn()
+
 	assert(ready, 'bus mailbox unexpectedly blocked')
+
 	if ok == true then return true, nil end
 	if ok == nil then return nil, reason or 'closed' end
 	return false, reason or 'full'
@@ -209,6 +222,7 @@ local function deliver_required_or_close(tx, value, close_reason)
 	if ok == true then
 		return true
 	end
+
 	tx:close(close_reason or reason or 'closed')
 	return false
 end
@@ -217,22 +231,27 @@ local function require_opts_table(name, opts, level)
 	if opts ~= nil and type(opts) ~= 'table' then
 		error(name .. ': opts must be a table (or nil)', (level or 1) + 1)
 	end
+
 	return opts or {}
 end
 
 local function resolve_queue_len(opts, default_len, name, level)
 	local qlen = opts.queue_len
 	if qlen == nil then qlen = default_len end
+
 	if type(qlen) ~= 'number' or qlen < 0 then
 		error(name .. ': queue_len must be >= 0', (level or 1) + 1)
 	end
+
 	return qlen
 end
 
 local function resolve_feed_opts(opts, default_len, default_full, name, level)
 	opts = require_opts_table(name, opts, (level or 1) + 1)
+
 	local qlen = resolve_queue_len(opts, default_len, name, (level or 1) + 1)
 	local full = assert_full_policy(opts.full or default_full, (level or 1) + 1) or DEFAULT_POLICY
+
 	return opts, qlen, full
 end
 
@@ -278,6 +297,7 @@ local function trusted_origin_base(conn)
 	if type(src) == 'function' then
 		src = src() or {}
 	end
+
 	return copy_table(src)
 end
 
@@ -286,12 +306,16 @@ end
 ---@return Origin
 local function build_origin(conn, extra)
 	local out = trusted_origin_base(conn)
+
 	if out.kind == nil then out.kind = 'local' end
+
 	out.conn_id   = conn._conn_id
 	out.principal = conn._principal
+
 	if type(extra) == 'table' and next(extra) ~= nil then
 		out.extra = freeze_shallow(copy_table(extra), 'origin.extra is immutable')
 	end
+
 	return freeze_shallow(out, 'origin is immutable')
 end
 
@@ -303,23 +327,27 @@ end
 ---@return function|nil
 local function authoriser_callable(auth)
 	if auth == nil then return nil end
+
 	if type(auth) == 'function' then
 		return function(ctx)
 			return auth(ctx)
 		end
 	end
+
 	if type(auth) == 'table' then
 		if type(auth.allow) == 'function' then
 			return function(ctx)
 				return auth:allow(ctx)
 			end
 		end
+
 		if type(auth.authorize) == 'function' then
 			return function(ctx)
 				return auth:authorize(ctx)
 			end
 		end
 	end
+
 	return nil
 end
 
@@ -350,6 +378,7 @@ local function authorize_action(bus, principal, action, topic, extra, level)
 	if ok == false or ok == nil then
 		return false, reason or 'forbidden'
 	end
+
 	return true, nil
 end
 
@@ -360,6 +389,7 @@ end
 ---@param level? integer
 local function assert_authorized(self, action, topic, extra, level)
 	level = (level or 1) + 1
+
 	local ok, reason = authorize_action(self._bus, self._principal, action, topic, extra, level)
 	if not ok then
 		error(
@@ -468,11 +498,13 @@ end
 ---@return boolean ok
 function Request:reply(value)
 	if self._done then return false end
+
 	self._done  = true
 	self._ok    = true
 	self._value = value
 	self._err   = nil
 	self._cond:signal()
+
 	return true
 end
 
@@ -480,11 +512,13 @@ end
 ---@return boolean ok
 function Request:fail(err)
 	if self._done then return false end
+
 	self._done  = true
 	self._ok    = false
 	self._value = nil
 	self._err   = err
 	self._cond:signal()
+
 	return true
 end
 
@@ -492,11 +526,13 @@ end
 ---@return boolean ok
 function Request:abandon(reason)
 	if self._done then return false end
+
 	self._done  = true
 	self._ok    = false
 	self._value = nil
 	self._err   = reason or 'abandoned'
 	self._cond:signal()
+
 	return true
 end
 
@@ -511,6 +547,7 @@ function Request:wait_reply_op()
 		if self._ok then
 			return op.always(self._value, nil)
 		end
+
 		return op.always(nil, self._err)
 	end
 
@@ -518,6 +555,7 @@ function Request:wait_reply_op()
 		if self._ok then
 			return self._value, nil
 		end
+
 		return nil, self._err
 	end)
 end
@@ -526,8 +564,58 @@ end
 -- Common feed-handle behaviour
 --------------------------------------------------------------------------------
 
+---@class Feed
 local Feed = {}
 Feed.__index = Feed
+
+---@class Subscription : Feed
+local Subscription = {}
+Subscription.__index = Subscription
+setmetatable(Subscription, { __index = Feed })
+
+---@class RetainedWatch : Feed
+local RetainedWatch = {}
+RetainedWatch.__index = RetainedWatch
+setmetatable(RetainedWatch, { __index = Feed })
+
+---@class Endpoint : Feed
+local Endpoint = {}
+Endpoint.__index = Endpoint
+setmetatable(Endpoint, { __index = Feed })
+
+local function new_feed(mt, conn, kind, topic, tx, rx, extra)
+	local obj = {
+		_conn             = conn,
+		_kind             = kind,
+		_topic            = topic,
+		_tx               = tx,
+		_rx               = rx,
+		_closed           = cond.new(),
+		_detach_finaliser = nil,
+	}
+
+	if extra then
+		for k, v in pairs(extra) do obj[k] = v end
+	end
+
+	return setmetatable(obj, mt)
+end
+
+local function new_subscription(conn, topic, tx, rx)
+	return new_feed(Subscription, conn, 'subscription', topic, tx, rx)
+end
+
+local function new_retained_watch(conn, topic, tx, rx)
+	return new_feed(RetainedWatch, conn, 'retained_watch', topic, tx, rx)
+end
+
+local function new_endpoint(conn, topic, key, tx, rx)
+	return new_feed(Endpoint, conn, 'endpoint', topic, tx, rx, { _key = key })
+end
+
+function Feed:kind()
+	return self._kind
+end
 
 function Feed:topic()
 	return self._topic
@@ -545,6 +633,19 @@ end
 ---@param reason any
 function Feed:_close(reason)
 	if self._tx then self._tx:close(reason) end
+	if self._closed then self._closed:signal() end
+end
+
+---@return Op
+function Feed:closed_op()
+	local why = self:why()
+	if why ~= nil then
+		return op.always(tostring(why))
+	end
+
+	return self._closed:wait_op():wrap(function ()
+		return tostring(self:why() or 'closed')
+	end)
 end
 
 ---@return Op
@@ -553,6 +654,7 @@ function Feed:recv_op()
 		if item == nil then
 			return nil, tostring(self._rx:why() or 'closed')
 		end
+
 		return item, nil
 	end)
 end
@@ -565,43 +667,11 @@ function Feed:iter()
 	return self._rx:iter()
 end
 
-local function new_feed(mt, conn, topic, tx, rx, extra)
-	local obj = {
-		_conn             = conn,
-		_topic            = topic,
-		_tx               = tx,
-		_rx               = rx,
-		_detach_finaliser = nil,
-	}
-	if extra then
-		for k, v in pairs(extra) do obj[k] = v end
+function Feed:payloads()
+	if getmetatable(self) ~= Subscription then
+		error('payloads expects a Subscription', 2)
 	end
-	return setmetatable(obj, mt)
-end
 
---------------------------------------------------------------------------------
--- Subscription (state/event plane)
---------------------------------------------------------------------------------
-
----@class Subscription : Feed
-local Subscription = {}
-Subscription.__index = Subscription
-setmetatable(Subscription, { __index = Feed })
-
-local function new_subscription(conn, topic, tx, rx)
-	return new_feed(Subscription, conn, topic, tx, rx)
-end
-
-function Subscription:unsubscribe()
-	local conn = self._conn
-	if not conn then
-		self:_close('unsubscribed')
-		return true
-	end
-	return conn:unsubscribe(self)
-end
-
-function Subscription:payloads()
 	local it = self._rx:iter()
 	return function ()
 		local msg = it()
@@ -609,62 +679,213 @@ function Subscription:payloads()
 	end
 end
 
-function Subscription:stats()
+function Feed:stats()
 	return {
 		dropped = self:dropped(),
 		topic   = self._topic,
+		kind    = self._kind,
 	}
 end
 
---------------------------------------------------------------------------------
--- Retained watch feed
---------------------------------------------------------------------------------
-
----@class RetainedWatch : Feed
-local RetainedWatch = {}
-RetainedWatch.__index = RetainedWatch
-setmetatable(RetainedWatch, { __index = Feed })
-
-local function new_retained_watch(conn, topic, tx, rx)
-	return new_feed(RetainedWatch, conn, topic, tx, rx)
-end
-
-function RetainedWatch:unwatch()
+function Feed:close()
 	local conn = self._conn
 	if not conn then
-		self:_close('unwatched')
+		self:_close(self._kind == 'endpoint' and 'unbound' or 'closed')
 		return true
 	end
-	return conn:unwatch_retained(self)
+
+	if getmetatable(self) == Subscription then
+		return conn:unsubscribe(self)
+	elseif getmetatable(self) == RetainedWatch then
+		return conn:unwatch_retained(self)
+	elseif getmetatable(self) == Endpoint then
+		return conn:unbind(self)
+	end
+
+	error('unknown feed kind: ' .. tostring(self._kind), 2)
 end
 
-function RetainedWatch:stats()
-	return {
-		dropped = self:dropped(),
-		topic   = self._topic,
-	}
+function Feed:unsubscribe()
+	if getmetatable(self) ~= Subscription then
+		error('unsubscribe expects a Subscription', 2)
+	end
+
+	return self:close()
+end
+
+function Feed:unwatch()
+	if getmetatable(self) ~= RetainedWatch then
+		error('unwatch expects a RetainedWatch', 2)
+	end
+
+	return self:close()
+end
+
+function Feed:unbind()
+	if getmetatable(self) ~= Endpoint then
+		error('unbind expects an Endpoint', 2)
+	end
+
+	return self:close()
 end
 
 --------------------------------------------------------------------------------
--- Endpoint (command plane)
+-- Retained materialised view
 --------------------------------------------------------------------------------
 
----@class Endpoint : Feed
-local Endpoint = {}
-Endpoint.__index = Endpoint
-setmetatable(Endpoint, { __index = Feed })
+---@class RetainedView
+---@field _conn Connection|nil
+---@field _bus Bus|nil
+---@field _topic Topic
+---@field _items table<string, Message>
+---@field _version integer
+---@field _changed Cond
+---@field _closed Cond
+---@field _closed_reason any
+---@field _detach_finaliser function|nil
+local RetainedView = {}
+RetainedView.__index = RetainedView
 
-local function new_endpoint(conn, topic, key, tx, rx)
-	return new_feed(Endpoint, conn, topic, tx, rx, { _key = key })
+local function new_retained_view(conn, topic)
+	return setmetatable({
+		_conn             = conn,
+		_bus              = conn._bus,
+		_topic            = topic,
+		_items            = {},
+		_version          = 0,
+		_changed          = cond.new(),
+		_closed           = cond.new(),
+		_closed_reason    = nil,
+		_detach_finaliser = nil,
+	}, RetainedView)
 end
 
-function Endpoint:unbind()
+function RetainedView:version()
+	return self._version
+end
+
+local function retained_view_bump(self)
+	self._version = self._version + 1
+	self._changed:signal()
+	self._changed = cond.new()
+end
+
+local function retained_view_set_msg(self, msg)
+	local key = topic_key(msg.topic)
+	local old = self._items[key]
+
+	if old
+		and old.payload == msg.payload
+		and old.origin == msg.origin
+	then
+		return
+	end
+
+	self._items[key] = new_msg(msg.topic, msg.payload, msg.origin)
+	retained_view_bump(self)
+end
+
+local function retained_view_delete_topic(self, topic)
+	local key = topic_key(topic)
+
+	if self._items[key] == nil then
+		return
+	end
+
+	self._items[key] = nil
+	retained_view_bump(self)
+end
+
+function RetainedView:_ingest(ev)
+	if self._closed_reason ~= nil then
+		return
+	end
+
+	if ev.op == 'retain' then
+		retained_view_set_msg(self, {
+			topic   = ev.topic,
+			payload = ev.payload,
+			origin  = ev.origin,
+		})
+	elseif ev.op == 'unretain' then
+		retained_view_delete_topic(self, ev.topic)
+	elseif ev.op == 'replay_done' then
+		-- Materialised views are kept directly by the bus. Replay markers are
+		-- feed-only events and do not affect the view.
+	else
+		-- Future-proof: ignore unknown retained lifecycle events.
+	end
+end
+
+function RetainedView:_close(reason)
+	if self._closed_reason ~= nil then return end
+
+	self._closed_reason = reason or 'closed'
+
+	local bus = self._bus
+	self._bus = nil
+
+	if bus then
+		bus:_remove_retained_view(self)
+	end
+
 	local conn = self._conn
-	if not conn then
-		if self._tx then self._tx:close('unbound') end
-		return true
+	self._conn = nil
+
+	if conn and conn._views then
+		conn._views[self] = nil
 	end
-	return conn:unbind(self)
+
+	clear_finaliser(self)
+
+	retained_view_bump(self)
+	self._closed:signal()
+end
+
+function RetainedView:close()
+	self:_close('closed')
+	return true
+end
+
+function RetainedView:closed_op()
+	if self._closed_reason ~= nil then
+		return op.always(tostring(self._closed_reason))
+	end
+
+	return self._closed:wait_op():wrap(function ()
+		return tostring(self._closed_reason or 'closed')
+	end)
+end
+
+function RetainedView:changed_op(last_seen)
+	if type(last_seen) ~= 'number' or last_seen % 1 ~= 0 then
+		error('retained_view.changed_op: last_seen must be an integer', 2)
+	end
+
+	if self._version ~= last_seen then
+		return op.always(self._version)
+	end
+
+	return self._changed:wait_op():wrap(function ()
+		return self._version
+	end)
+end
+
+function RetainedView:get(topic)
+	assert_topic(topic, 'topic', 2)
+	return self._items[topic_key(topic)]
+end
+
+function RetainedView:snapshot()
+	local out = {}
+	for k, msg in pairs(self._items) do
+		out[k] = msg
+	end
+	return out
+end
+
+function RetainedView:items()
+	return self:snapshot()
 end
 
 --------------------------------------------------------------------------------
@@ -677,6 +898,7 @@ end
 ---@field _topics any
 ---@field _retained any
 ---@field _retained_watchers any
+---@field _retained_views any
 ---@field _conns table<Connection, boolean>
 ---@field _s_wild string|number
 ---@field _m_wild string|number
@@ -711,7 +933,9 @@ end
 function Bus:_unsubscribe(sub)
 	local subs = self._topics:retrieve(sub._topic)
 	if not subs then return end
+
 	subs[sub] = nil
+
 	if next(subs) == nil then
 		self._topics:delete(sub._topic)
 	end
@@ -737,15 +961,54 @@ function Bus:_notify_retained(ev)
 	end)
 end
 
+function Bus:_add_retained_view(view)
+	local views = self._retained_views:retrieve(view._topic)
+	if not views then
+		views = {}
+		self._retained_views:insert(view._topic, views)
+	end
+
+	views[view] = true
+
+	self._retained:each(view._topic, function (_k, retained_msg)
+		retained_view_set_msg(view, retained_msg)
+	end)
+end
+
+function Bus:_remove_retained_view(view)
+	local views = self._retained_views:retrieve(view._topic)
+	if not views then return end
+
+	views[view] = nil
+
+	if next(views) == nil then
+		self._retained_views:delete(view._topic)
+	end
+end
+
+function Bus:_notify_retained_views(ev)
+	self._retained_views:each(ev.topic, function (_k, views)
+		for view in pairs(views) do
+			view:_ingest(ev)
+		end
+	end)
+end
+
 function Bus:_retain(msg)
 	self:_publish(msg)
 	self._retained:insert(msg.topic, msg)
-	self:_notify_retained(new_retained_event('retain', msg.topic, msg.payload, msg.origin))
+
+	local ev = new_retained_event('retain', msg.topic, msg.payload, msg.origin)
+	self:_notify_retained(ev)
+	self:_notify_retained_views(ev)
 end
 
 function Bus:_unretain(topic, origin)
 	self._retained:delete(topic)
-	self:_notify_retained(new_retained_event('unretain', topic, nil, origin))
+
+	local ev = new_retained_event('unretain', topic, nil, origin)
+	self:_notify_retained(ev)
+	self:_notify_retained_views(ev)
 end
 
 ---@param conn Connection
@@ -772,7 +1035,9 @@ function Bus:_watch_retained(conn, topic, qlen, full, replay)
 		end)
 
 		if not deliver_required_or_close(tx, new_replay_done_event(), 'replay_overflow') then
+			rw:_close('replay_overflow')
 			watchers[rw] = nil
+
 			if next(watchers) == nil then
 				self._retained_watchers:delete(topic)
 			end
@@ -785,7 +1050,9 @@ end
 function Bus:_unwatch_retained(rw)
 	local watchers = self._retained_watchers:retrieve(rw._topic)
 	if not watchers then return end
+
 	watchers[rw] = nil
+
 	if next(watchers) == nil then
 		self._retained_watchers:delete(rw._topic)
 	end
@@ -803,6 +1070,7 @@ end
 ---@field _subs table<Subscription, boolean>
 ---@field _eps table<Endpoint, boolean>
 ---@field _rws table<RetainedWatch, boolean>
+---@field _views table<RetainedView, boolean>
 ---@field _disconnected boolean
 ---@field _conn_id string
 ---@field _origin_factory table|fun():table
@@ -824,6 +1092,7 @@ local function new_connection(bus, principal, q_length, full, origin_factory)
 		_subs           = {},
 		_eps            = {},
 		_rws            = {},
+		_views          = {},
 		_disconnected   = false,
 		_conn_id        = tostring(uuid.new()),
 		_origin_factory = origin_factory or {},
@@ -842,6 +1111,7 @@ end
 ---@return Connection
 function Connection:derive(opts)
 	assert_connected(self, 1)
+
 	opts = require_opts_table('derive', opts, 2)
 
 	local bus = assert(self._bus)
@@ -854,11 +1124,13 @@ end
 
 function Connection:dropped()
 	local n = 0
+
 	for _, set in ipairs({ self._subs, self._eps, self._rws }) do
 		for item in pairs(set) do
 			n = n + (item:dropped() or 0)
 		end
 	end
+
 	return n
 end
 
@@ -866,7 +1138,8 @@ function Connection:publish(topic, payload, opts)
 	assert_connected(self, 1)
 	assert_topic(topic, 'topic', 1)
 
-	opts = opts or {}
+	opts = require_opts_table('publish', opts, 2)
+
 	assert_authorized(self, 'publish', topic, {
 		payload = payload,
 		opts    = opts,
@@ -880,7 +1153,8 @@ function Connection:retain(topic, payload, opts)
 	assert_connected(self, 1)
 	assert_topic(topic, 'topic', 1)
 
-	opts = opts or {}
+	opts = require_opts_table('retain', opts, 2)
+
 	assert_authorized(self, 'retain', topic, {
 		payload = payload,
 		opts    = opts,
@@ -894,7 +1168,8 @@ function Connection:unretain(topic, opts)
 	assert_connected(self, 1)
 	assert_topic(topic, 'topic', 1)
 
-	opts = opts or {}
+	opts = require_opts_table('unretain', opts, 2)
+
 	assert_authorized(self, 'unretain', topic, {
 		opts = opts,
 	}, 1)
@@ -942,7 +1217,9 @@ function Connection:unsubscribe(sub)
 		self._subs[sub] = nil
 		self._bus:_unsubscribe(sub)
 	end
+
 	if sub._conn == self then sub._conn = nil end
+
 	return true
 end
 
@@ -953,6 +1230,7 @@ function Connection:_watch_retained_internal(topic, opts)
 	assert_connected(self, 1)
 
 	opts = require_opts_table('_watch_retained_internal', opts, 2)
+
 	local _, qlen, full = resolve_feed_opts(opts, self._q_length, self._full, '_watch_retained_internal', 2)
 	local replay = not not opts.replay
 	local rw = self._bus:_watch_retained(self, topic, qlen, full, replay)
@@ -987,8 +1265,31 @@ function Connection:unwatch_retained(rw)
 		self._rws[rw] = nil
 		self._bus:_unwatch_retained(rw)
 	end
+
 	if rw._conn == self then rw._conn = nil end
+
 	return true
+end
+
+---@param topic Topic
+---@param opts? table
+---@return RetainedView
+function Connection:retained_view(topic, opts)
+	assert_connected(self, 1)
+	assert_topic(topic, 'topic', 1)
+
+	opts = require_opts_table('retained_view', opts, 2)
+
+	assert_authorized(self, 'watch_retained', topic, {
+		opts = opts,
+	}, 1)
+
+	local view = new_retained_view(self, topic)
+	self._bus:_add_retained_view(view)
+
+	return own_in_scope(self._views, view, function ()
+		view:_close('scope_closed')
+	end)
 end
 
 ---@param topic Topic
@@ -1013,6 +1314,7 @@ function Connection:_bind_internal(topic, opts)
 	local ep     = new_endpoint(self, topic, key, tx, rx)
 
 	bus._endpoints[key] = ep
+
 	return own_in_scope(self._eps, ep, function ()
 		ep:unbind()
 	end)
@@ -1036,17 +1338,19 @@ function Connection:unbind(ep)
 
 	local bus = self._bus
 
-	if ep._tx then ep._tx:close('unbound') end
+	ep:_close('unbound')
 	clear_finaliser(ep)
 
 	if self._eps[ep] then
 		self._eps[ep] = nil
+
 		if bus and bus._endpoints and bus._endpoints[ep._key] == ep then
 			bus._endpoints[ep._key] = nil
 		end
 	end
 
 	if ep._conn == self then ep._conn = nil end
+
 	return true
 end
 
@@ -1086,6 +1390,7 @@ function Connection:call_op(topic, payload, opts)
 
 		local key = topic_key(topic)
 		local ep  = bus._endpoints[key]
+
 		if not ep or not ep._tx then
 			return op.always(nil, 'no_route')
 		end
@@ -1113,6 +1418,7 @@ end
 
 function Connection:disconnect()
 	if self._disconnected then return true end
+
 	self._disconnected = true
 
 	local bus = self._bus
@@ -1121,7 +1427,9 @@ function Connection:disconnect()
 	disconnect_all(self._subs, function (sub)
 		sub:_close('disconnected')
 		clear_finaliser(sub)
+
 		if bus then bus:_unsubscribe(sub) end
+
 		self._subs[sub] = nil
 		if sub._conn == self then sub._conn = nil end
 	end)
@@ -1129,24 +1437,34 @@ function Connection:disconnect()
 	disconnect_all(self._rws, function (rw)
 		rw:_close('disconnected')
 		clear_finaliser(rw)
+
 		if bus then bus:_unwatch_retained(rw) end
+
 		self._rws[rw] = nil
 		if rw._conn == self then rw._conn = nil end
 	end)
 
 	disconnect_all(self._eps, function (ep)
-		if ep._tx then ep._tx:close('disconnected') end
+		ep:_close('disconnected')
+
 		if bus and bus._endpoints and bus._endpoints[ep._key] == ep then
 			bus._endpoints[ep._key] = nil
 		end
+
 		clear_finaliser(ep)
+
 		self._eps[ep] = nil
 		if ep._conn == self then ep._conn = nil end
+	end)
+
+	disconnect_all(self._views, function (view)
+		view:_close('disconnected')
 	end)
 
 	if bus and bus._conns then
 		bus._conns[self] = nil
 	end
+
 	return true
 end
 
@@ -1156,6 +1474,7 @@ function Connection:stats()
 		subscriptions    = count_keys(self._subs),
 		endpoints        = count_keys(self._eps),
 		retained_watches = count_keys(self._rws),
+		retained_views   = count_keys(self._views),
 	}
 end
 
@@ -1171,6 +1490,7 @@ function Bus:connect(opts)
 	local conn = new_connection(self, opts.principal, self._q_length, self._full, origin_factory)
 
 	self._conns[conn] = true
+
 	s:finally(function ()
 		conn:disconnect()
 	end)
@@ -1183,12 +1503,14 @@ function Bus:stats()
 	local dropped          = 0
 	local endpoints        = 0
 	local retained_watches = 0
+	local retained_views   = 0
 
 	for conn in pairs(self._conns) do
 		connections      = connections + 1
 		dropped          = dropped + conn:dropped()
 		endpoints        = endpoints + count_keys(conn._eps or {})
 		retained_watches = retained_watches + count_keys(conn._rws or {})
+		retained_views   = retained_views + count_keys(conn._views or {})
 	end
 
 	return {
@@ -1199,6 +1521,7 @@ function Bus:stats()
 		s_wild           = self._s_wild,
 		m_wild           = self._m_wild,
 		retained_watches = retained_watches,
+		retained_views   = retained_views,
 		endpoints        = endpoints,
 	}
 end
@@ -1214,6 +1537,7 @@ local function new(params)
 
 	local q_length = params.q_length
 	if q_length == nil then q_length = DEFAULT_Q_LEN end
+
 	if type(q_length) ~= 'number' or q_length < 0 then
 		error('bus.new: q_length must be >= 0', 2)
 	end
@@ -1235,6 +1559,7 @@ local function new(params)
 		_topics            = trie.new_pubsub(s_wild, m_wild),
 		_retained          = trie.new_retained(s_wild, m_wild),
 		_retained_watchers = trie.new_pubsub(s_wild, m_wild),
+		_retained_views    = trie.new_pubsub(s_wild, m_wild),
 		_conns             = setmetatable({}, { __mode = 'k' }),
 		_endpoints         = {},
 		_authoriser        = authoriser,
@@ -1248,9 +1573,10 @@ return {
 	Connection    = Connection,
 	Subscription  = Subscription,
 	RetainedWatch = RetainedWatch,
-	RetainedEvent = RetainedEvent,
+	RetainedView  = RetainedView,
 	Endpoint      = Endpoint,
 	Message       = Message,
+	RetainedEvent = RetainedEvent,
 	Request       = Request,
 	Origin        = Origin,
 
