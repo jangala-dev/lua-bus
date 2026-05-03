@@ -857,17 +857,41 @@ function RetainedView:closed_op()
 	end)
 end
 
+--- Wait until the retained view changes from last_seen, or closes.
+---
+--- Return shape:
+---   changed: version, nil
+---   closed : nil, reason
+---@param last_seen integer
+---@return Op
 function RetainedView:changed_op(last_seen)
 	if type(last_seen) ~= 'number' or last_seen % 1 ~= 0 then
 		error('retained_view.changed_op: last_seen must be an integer', 2)
 	end
 
+	local function close_reason()
+		if self._closed_reason ~= nil then
+			return tostring(self._closed_reason)
+		end
+		return nil
+	end
+
+	local why = close_reason()
+	if why ~= nil then
+		return op.always(nil, why)
+	end
+
 	if self._version ~= last_seen then
-		return op.always(self._version)
+		return op.always(self._version, nil)
 	end
 
 	return self._changed:wait_op():wrap(function ()
-		return self._version
+		local reason = close_reason()
+		if reason ~= nil then
+			return nil, reason
+		end
+
+		return self._version, nil
 	end)
 end
 
@@ -876,11 +900,21 @@ function RetainedView:get(topic)
 	return self._items[topic_key(topic)]
 end
 
+--- Return a deterministic array of retained Message objects in this view.
+---
+--- This deliberately does not expose the bus's internal topic_key() map.
+---@return Message[]
 function RetainedView:snapshot()
 	local out = {}
-	for k, msg in pairs(self._items) do
-		out[k] = msg
+
+	for _, msg in pairs(self._items) do
+		out[#out + 1] = msg
 	end
+
+	table.sort(out, function (a, b)
+		return topic_key(a.topic) < topic_key(b.topic)
+	end)
+
 	return out
 end
 
