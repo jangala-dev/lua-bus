@@ -38,14 +38,6 @@ local function topic_str(topic)
 	return table.concat(parts, '/')
 end
 
-local function table_count(t)
-	local n = 0
-	for _ in pairs(t or {}) do
-		n = n + 1
-	end
-	return n
-end
-
 local function assert_local_origin(origin, principal)
 	assert(type(origin) == 'table', 'expected origin table')
 	assert_eq(origin.kind, 'local', 'expected local origin kind')
@@ -83,7 +75,7 @@ local function assert_origin_extra_immutable(origin)
 	assert(not ok, 'expected origin.extra to be immutable')
 end
 
--- A standard “deadline arm”: returns (nil, 'timeout').
+-- A standard deadline arm: returns (nil, 'timeout').
 local function timeout_op(dt)
 	return Sleep.sleep_op(dt):wrap(function ()
 		return nil, 'timeout'
@@ -97,7 +89,7 @@ end
 
 local function wait_view_changed(view, last_seen, label)
 	local which, version, err = select_named({
-		changed  = view:changed_op(last_seen):wrap(function (v) return v, nil end),
+		changed  = view:changed_op(last_seen),
 		deadline = timeout_op(LONG_TMO),
 	})
 
@@ -105,6 +97,17 @@ local function wait_view_changed(view, last_seen, label)
 	assert(err == nil, tostring(err))
 	assert(type(version) == 'number', 'expected numeric retained view version')
 	return version
+end
+
+local function wait_view_closed(view, last_seen, expected_reason, label)
+	local which, version, err = select_named({
+		changed  = view:changed_op(last_seen),
+		deadline = timeout_op(LONG_TMO),
+	})
+
+	assert_eq(which, 'changed', label or 'expected retained view close to wake changed_op')
+	assert(version == nil, 'expected nil version when retained view is closed')
+	assert_eq(err, expected_reason or 'closed')
 end
 
 --------------------------------------------------------------------------------
@@ -153,7 +156,7 @@ local function new_admin_only_authoriser(log)
 end
 
 --------------------------------------------------------------------------------
--- Test Simple PubSub (direct op performance)
+-- Test Simple PubSub
 --------------------------------------------------------------------------------
 
 local function test_simple()
@@ -172,7 +175,7 @@ local function test_simple()
 end
 
 --------------------------------------------------------------------------------
--- Test Selecting Across Subscriptions (fan-in / select)
+-- Test Selecting Across Subscriptions
 --------------------------------------------------------------------------------
 
 local function test_select_across_subs()
@@ -197,7 +200,7 @@ local function test_select_across_subs()
 end
 
 --------------------------------------------------------------------------------
--- Test Absence as a Race (no baked-in timeouts)
+-- Test Absence as a Race
 --------------------------------------------------------------------------------
 
 local function test_absence_via_deadline()
@@ -218,7 +221,7 @@ local function test_absence_via_deadline()
 end
 
 --------------------------------------------------------------------------------
--- Test Graceful Consumer Stop (external control op + acknowledgements)
+-- Test Graceful Consumer Stop
 --------------------------------------------------------------------------------
 
 local function test_graceful_stop_signal()
@@ -228,7 +231,6 @@ local function test_graceful_stop_signal()
 
 	local stop = Cond.new()
 
-	-- Consumer acks each processed message so the test can be deterministic.
 	local ack  = Channel.new(10)
 	local done = Channel.new(1)
 
@@ -248,19 +250,16 @@ local function test_graceful_stop_signal()
 			assert(err == nil, tostring(err))
 			out[#out + 1] = msg.payload
 
-			-- Ack should not block in the test.
 			ack:put(msg.payload)
 		end
 
 		done:put(out)
 	end)
 
-	-- Publish three messages.
 	conn:publish({ 'loop', 'topic' }, 'one')
 	conn:publish({ 'loop', 'topic' }, 'two')
 	conn:publish({ 'loop', 'topic' }, 'three')
 
-	-- Wait for three acks (each is itself a race).
 	local expect = { 'one', 'two', 'three' }
 	for i = 1, #expect do
 		local which, v, err = select_named({
@@ -272,7 +271,6 @@ local function test_graceful_stop_signal()
 		assert(v == expect[i], ('expected ack %q, got %q'):format(tostring(expect[i]), tostring(v)))
 	end
 
-	-- Now request stop, and ensure the consumer terminates promptly.
 	stop:signal()
 
 	local which, out, err = select_named({
@@ -304,7 +302,6 @@ local function test_conn_clean()
 
 	conn:disconnect()
 
-	-- Subscription should close promptly with reason "disconnected".
 	local which, m2, e2 = select_named({
 		msg      = sub:recv_op(),
 		deadline = timeout_op(LONG_TMO),
@@ -313,7 +310,6 @@ local function test_conn_clean()
 	assert(m2 == nil)
 	assert(e2 == 'disconnected', ('expected disconnected, got %s'):format(tostring(e2)))
 
-	-- Disconnected connections must not be usable.
 	local ok = pcall(function ()
 		conn:publish({ 'cleanup', 'topic' }, 'should error')
 	end)
@@ -450,7 +446,6 @@ local function test_retained_watch_replay_and_live_changes()
 		assert_local_origin(ev.origin)
 	end
 
-	-- Ordinary publish should not appear on retained watch feeds.
 	conn:publish({ 'watch', 'c' }, 'PUBONLY')
 
 	do
@@ -808,7 +803,7 @@ local function test_retained_view_empty_replay_ready()
 
 	do
 		local which, version, err = select_named({
-			changed  = view:changed_op(view:version()):wrap(function (v) return v, nil end),
+			changed  = view:changed_op(view:version()),
 			deadline = timeout_op(TMO),
 		})
 		assert_eq(which, 'deadline')
@@ -848,7 +843,7 @@ local function test_retained_view_replay_snapshot_and_live_changes()
 	assert(ma and ma.payload == 'A1', 'expected replayed A1')
 	assert(mb and mb.payload == 'B1', 'expected replayed B1')
 	assert(mx == nil, 'expected non-matching retained topic to be absent')
-	assert_eq(table_count(view:snapshot()), 2, 'expected two retained view items')
+	assert_eq(#view:snapshot(), 2, 'expected two retained view items')
 	assert(view:version() >= 2, 'expected replay to advance version')
 
 	local last = view:version()
@@ -866,7 +861,7 @@ local function test_retained_view_replay_snapshot_and_live_changes()
 
 	do
 		local which, version, err = select_named({
-			changed  = view:changed_op(last):wrap(function (v) return v, nil end),
+			changed  = view:changed_op(last),
 			deadline = timeout_op(TMO),
 		})
 		assert_eq(which, 'deadline')
@@ -877,7 +872,7 @@ local function test_retained_view_replay_snapshot_and_live_changes()
 	last = wait_view_changed(view, last, 'expected unretain to change view')
 
 	assert(view:get({ 'view', 'state', 'b' }) == nil, 'expected b to be removed')
-	assert_eq(table_count(view:items()), 1, 'expected one retained view item after unretain')
+	assert_eq(#view:items(), 1, 'expected one retained view item after unretain')
 
 	view:close()
 
@@ -896,15 +891,15 @@ local function test_retained_view_wildcards_and_literal_tokens()
 	local view_lit_plus = conn:retained_view({ 'viewlit', 'metrics', Bus.literal('+') })
 	local view_lit_hash_mid = conn:retained_view({ 'viewlit', 'lit', Bus.literal('#'), 'x' })
 
-	assert_eq(table_count(view_wild:snapshot()), 2, 'wild view should include PLUS and ABC')
+	assert_eq(#view_wild:snapshot(), 2, 'wild view should include PLUS and ABC')
 	assert(view_wild:get({ 'viewlit', 'metrics', '+' }).payload == 'PLUS')
 	assert(view_wild:get({ 'viewlit', 'metrics', 'abc' }).payload == 'ABC')
 
-	assert_eq(table_count(view_lit_plus:snapshot()), 1, 'literal plus view should include only literal plus')
+	assert_eq(#view_lit_plus:snapshot(), 1, 'literal plus view should include only literal plus')
 	assert(view_lit_plus:get({ 'viewlit', 'metrics', '+' }).payload == 'PLUS')
 	assert(view_lit_plus:get({ 'viewlit', 'metrics', 'abc' }) == nil)
 
-	assert_eq(table_count(view_lit_hash_mid:snapshot()), 1, 'literal hash view should include only literal hash mid-token')
+	assert_eq(#view_lit_hash_mid:snapshot(), 1, 'literal hash view should include only literal hash mid-token')
 	assert(view_lit_hash_mid:get({ 'viewlit', 'lit', '#', 'x' }).payload == 'HASHMID')
 
 	view_wild:close()
@@ -953,15 +948,7 @@ local function test_retained_view_close_and_disconnect()
 	local last = view:version()
 	view:close()
 
-	do
-		local which, version, err = select_named({
-			changed  = view:changed_op(last):wrap(function (v) return v, nil end),
-			deadline = timeout_op(LONG_TMO),
-		})
-		assert_eq(which, 'changed')
-		assert(err == nil)
-		assert(version > last, 'expected close to advance view version')
-	end
+	wait_view_closed(view, last, 'closed')
 
 	do
 		local reason = fibers.perform(view:closed_op())
@@ -975,7 +962,10 @@ local function test_retained_view_close_and_disconnect()
 	local view2 = conn2:retained_view({ 'view', 'disconnect' })
 	assert_eq(bus:stats().retained_views, 1)
 
+	local last2 = view2:version()
 	conn2:disconnect()
+
+	wait_view_closed(view2, last2, 'disconnected')
 
 	do
 		local reason = fibers.perform(view2:closed_op())
@@ -1018,7 +1008,7 @@ local function test_retained_view_no_queue_overflow_or_background_fibre()
 		full      = 'reject_newest',
 	})
 
-	assert_eq(table_count(view:snapshot()), 20, 'retained view should materialise all matching retained state')
+	assert_eq(#view:snapshot(), 20, 'retained view should materialise all matching retained state')
 	assert_eq(conn:dropped(), 0, 'retained view should not use a lossy mailbox')
 	assert_eq(bus:stats().dropped, 0, 'retained view should not affect bus dropped count')
 	assert_eq(conn:stats().retained_watches, 0, 'retained view should not create retained watch feed')
@@ -1459,7 +1449,7 @@ local function test_derive_connection_scope_cleanup()
 	local outer = bus:connect()
 	local sub = outer:subscribe({ 'derive', 'scope' }, { queue_len = 4 })
 
-	local st, rep = fibers.run_scope(function (s)
+	local st, rep = fibers.run_scope(function ()
 		local parent = bus:connect({ principal = admin_principal('scoped-parent') })
 		local child  = parent:derive()
 		child:publish({ 'derive', 'scope' }, 'before')
@@ -1521,7 +1511,6 @@ local function test_request_done_state_for_fail_and_abandon()
 	local r = req.__index and nil
 	assert(origin ~= nil and r == nil)
 
-	-- Use the real command plane instead of constructing Request internals directly.
 	local bus    = Bus.new({ m_wild = '#', s_wild = '+' })
 	local server = bus:connect()
 	local client = bus:connect()
@@ -1870,7 +1859,6 @@ local function test_laneB_concrete_topic_enforcement_and_literal_ok()
 	print('Lane B concrete-topic enforcement + literal wrapper test passed!')
 end
 
--- Explicit modality check: publish() does not reach endpoints; call() does.
 local function test_laneB_endpoint_not_reached_by_publish()
 	local bus    = Bus.new({ m_wild = '#', s_wild = '+' })
 	local server = bus:connect()
@@ -1992,7 +1980,7 @@ local function test_laneB_call_fail_propagates_error()
 end
 
 --------------------------------------------------------------------------------
--- Scope cancellation as control flow (no local exception handling)
+-- Scope cancellation as control flow
 --------------------------------------------------------------------------------
 
 local function test_scope_cancellation_terminates_waits()
@@ -2089,7 +2077,6 @@ local function test_authz_admin_allows_and_records_actions()
 
 	assert(conn1:principal() == admin1, 'expected principal() to return supplied principal')
 
-	-- subscribe + publish
 	local sub = conn1:subscribe({ 'authz', 'pubsub' })
 	conn1:publish({ 'authz', 'pubsub' }, 'hello')
 	do
@@ -2098,7 +2085,6 @@ local function test_authz_admin_allows_and_records_actions()
 		assert_local_origin(msg.origin, admin1)
 	end
 
-	-- retain + unretain
 	conn1:retain({ 'authz', 'retained' }, 'R')
 	local sub_ret = conn1:subscribe({ 'authz', 'retained' })
 	do
@@ -2116,10 +2102,8 @@ local function test_authz_admin_allows_and_records_actions()
 		assert_timeout(msg, err)
 	end
 
-	-- watch_retained
 	local rw = conn1:watch_retained({ 'authz', 'watch' }, { replay = true })
 
-	-- replay=true always emits a replay_done marker, even when the initial set is empty.
 	do
 		local ev, err = fibers.perform(rw:recv_op())
 		assert(err == nil and ev, tostring(err))
@@ -2137,7 +2121,6 @@ local function test_authz_admin_allows_and_records_actions()
 
 	rw:unwatch()
 
-	-- retained_view is authorised as watch_retained.
 	local view = conn1:retained_view({ 'authz', 'view' })
 	conn1:retain({ 'authz', 'view' }, 'VW')
 	do
@@ -2146,7 +2129,6 @@ local function test_authz_admin_allows_and_records_actions()
 	end
 	view:close()
 
-	-- bind + call
 	local rpc_ep = conn2:bind({ 'authz', 'rpc' }, { queue_len = 1 })
 	fibers.spawn(function()
 		local req, err = rpc_ep:recv()
