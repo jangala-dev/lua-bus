@@ -38,6 +38,14 @@ local function topic_str(topic)
 	return table.concat(parts, '/')
 end
 
+local function table_count(t)
+	local n = 0
+	for _ in pairs(t or {}) do
+		n = n + 1
+	end
+	return n
+end
+
 local function assert_local_origin(origin, principal)
 	assert(type(origin) == 'table', 'expected origin table')
 	assert_eq(origin.kind, 'local', 'expected local origin kind')
@@ -85,6 +93,18 @@ end
 -- Named-choice convenience: returns (winner_name, ...arm_results...)
 local function select_named(arms)
 	return fibers.perform(fibers.named_choice(arms))
+end
+
+local function wait_view_changed(view, last_seen, label)
+	local which, version, err = select_named({
+		changed  = view:changed_op(last_seen):wrap(function (v) return v, nil end),
+		deadline = timeout_op(LONG_TMO),
+	})
+
+	assert_eq(which, 'changed', label or 'expected retained view to change')
+	assert(err == nil, tostring(err))
+	assert(type(version) == 'number', 'expected numeric retained view version')
+	return version
 end
 
 --------------------------------------------------------------------------------
@@ -691,6 +711,325 @@ local function test_retained_watch_replay_overflow_closes_watch()
 end
 
 --------------------------------------------------------------------------------
+-- Feed handle shape tests
+--------------------------------------------------------------------------------
+
+local function test_feed_distinct_metatables_and_method_guards()
+	local bus  = Bus.new({ m_wild = '#', s_wild = '+' })
+	local conn = bus:connect()
+
+	local sub = conn:subscribe({ 'feed', 'sub' })
+	local rw  = conn:watch_retained({ 'feed', 'rw' })
+	local ep  = conn:bind({ 'feed', 'ep' }, { queue_len = 1 })
+
+	assert_eq(getmetatable(sub), Bus.Subscription, 'subscription metatable')
+	assert_eq(getmetatable(rw),  Bus.RetainedWatch, 'retained watch metatable')
+	assert_eq(getmetatable(ep),  Bus.Endpoint, 'endpoint metatable')
+
+	assert(Bus.Subscription ~= Bus.RetainedWatch, 'Subscription and RetainedWatch should be distinct')
+	assert(Bus.Subscription ~= Bus.Endpoint, 'Subscription and Endpoint should be distinct')
+	assert(Bus.RetainedWatch ~= Bus.Endpoint, 'RetainedWatch and Endpoint should be distinct')
+
+	assert_eq(sub:kind(), 'subscription')
+	assert_eq(rw:kind(), 'retained_watch')
+	assert_eq(ep:kind(), 'endpoint')
+
+	assert_eq(topic_str(sub:topic()), 'feed/sub')
+	assert_eq(topic_str(rw:topic()), 'feed/rw')
+	assert_eq(topic_str(ep:topic()), 'feed/ep')
+
+	local ok_payloads = pcall(function () rw:payloads() end)
+	assert(not ok_payloads, 'expected retained watch payloads() to error')
+
+	local ok_unwatch_sub = pcall(function () sub:unwatch() end)
+	assert(not ok_unwatch_sub, 'expected subscription:unwatch() to error')
+
+	local ok_unsub_rw = pcall(function () rw:unsubscribe() end)
+	assert(not ok_unsub_rw, 'expected retained_watch:unsubscribe() to error')
+
+	local ok_unsub_ep = pcall(function () ep:unsubscribe() end)
+	assert(not ok_unsub_ep, 'expected endpoint:unsubscribe() to error')
+
+	local ok_unbind_sub = pcall(function () sub:unbind() end)
+	assert(not ok_unbind_sub, 'expected subscription:unbind() to error')
+
+	sub:unsubscribe()
+	rw:unwatch()
+	ep:unbind()
+
+	print('Feed distinct metatables + method guards test passed!')
+end
+
+local function test_feed_closed_op_reason()
+	local bus  = Bus.new({ m_wild = '#', s_wild = '+' })
+	local conn = bus:connect()
+
+	local sub = conn:subscribe({ 'feed', 'closed', 'sub' })
+	local rw  = conn:watch_retained({ 'feed', 'closed', 'rw' })
+	local ep  = conn:bind({ 'feed', 'closed', 'ep' }, { queue_len = 1 })
+
+	sub:unsubscribe()
+	rw:unwatch()
+	ep:unbind()
+
+	do
+		local reason = fibers.perform(sub:closed_op())
+		assert_eq(reason, 'unsubscribed')
+	end
+
+	do
+		local reason = fibers.perform(rw:closed_op())
+		assert_eq(reason, 'unwatched')
+	end
+
+	do
+		local reason = fibers.perform(ep:closed_op())
+		assert_eq(reason, 'unbound')
+	end
+
+	print('Feed closed_op reason test passed!')
+end
+
+--------------------------------------------------------------------------------
+-- Retained materialised view tests
+--------------------------------------------------------------------------------
+
+local function test_retained_view_empty_replay_ready()
+	local bus  = Bus.new({ m_wild = '#', s_wild = '+' })
+	local conn = bus:connect()
+
+	local view = conn:retained_view({ 'view', 'empty', '#' })
+
+	assert_eq(getmetatable(view), Bus.RetainedView)
+	assert_eq(view:version(), 0)
+	assert_eq(conn:stats().retained_views, 1)
+	assert_eq(bus:stats().retained_views, 1)
+	assert(view:get({ 'view', 'empty', 'missing' }) == nil, 'expected empty view')
+
+	do
+		local which, version, err = select_named({
+			changed  = view:changed_op(view:version()):wrap(function (v) return v, nil end),
+			deadline = timeout_op(TMO),
+		})
+		assert_eq(which, 'deadline')
+		assert_timeout(version, err)
+	end
+
+	view:close()
+
+	assert_eq(conn:stats().retained_views, 0)
+	assert_eq(bus:stats().retained_views, 0)
+
+	do
+		local reason = fibers.perform(view:closed_op())
+		assert_eq(reason, 'closed')
+	end
+
+	print('Retained view empty replay ready test passed!')
+end
+
+local function test_retained_view_replay_snapshot_and_live_changes()
+	local bus  = Bus.new({ m_wild = '#', s_wild = '+' })
+	local conn = bus:connect()
+
+	conn:retain({ 'view', 'state', 'a' }, 'A1')
+	conn:retain({ 'view', 'state', 'b' }, 'B1')
+	conn:retain({ 'view', 'other', 'x' }, 'X1')
+
+	local view = conn:retained_view({ 'view', 'state', '#' })
+
+	assert_eq(conn:stats().retained_views, 1)
+	assert_eq(bus:stats().retained_views, 1)
+
+	local ma = view:get({ 'view', 'state', 'a' })
+	local mb = view:get({ 'view', 'state', 'b' })
+	local mx = view:get({ 'view', 'other', 'x' })
+
+	assert(ma and ma.payload == 'A1', 'expected replayed A1')
+	assert(mb and mb.payload == 'B1', 'expected replayed B1')
+	assert(mx == nil, 'expected non-matching retained topic to be absent')
+	assert_eq(table_count(view:snapshot()), 2, 'expected two retained view items')
+	assert(view:version() >= 2, 'expected replay to advance version')
+
+	local last = view:version()
+
+	conn:retain({ 'view', 'state', 'a' }, 'A2')
+	last = wait_view_changed(view, last, 'expected retain update to change view')
+
+	do
+		local msg = view:get({ 'view', 'state', 'a' })
+		assert(msg and msg.payload == 'A2', 'expected updated retained payload')
+		assert_local_origin(msg.origin)
+	end
+
+	conn:retain({ 'view', 'other', 'x' }, 'X2')
+
+	do
+		local which, version, err = select_named({
+			changed  = view:changed_op(last):wrap(function (v) return v, nil end),
+			deadline = timeout_op(TMO),
+		})
+		assert_eq(which, 'deadline')
+		assert_timeout(version, err)
+	end
+
+	conn:unretain({ 'view', 'state', 'b' })
+	last = wait_view_changed(view, last, 'expected unretain to change view')
+
+	assert(view:get({ 'view', 'state', 'b' }) == nil, 'expected b to be removed')
+	assert_eq(table_count(view:items()), 1, 'expected one retained view item after unretain')
+
+	view:close()
+
+	print('Retained view replay snapshot + live changes test passed!')
+end
+
+local function test_retained_view_wildcards_and_literal_tokens()
+	local bus  = Bus.new({ m_wild = '#', s_wild = '+' })
+	local conn = bus:connect()
+
+	conn:retain({ 'viewlit', 'metrics', '+' }, 'PLUS')
+	conn:retain({ 'viewlit', 'metrics', 'abc' }, 'ABC')
+	conn:retain({ 'viewlit', 'lit', '#', 'x' }, 'HASHMID')
+
+	local view_wild = conn:retained_view({ 'viewlit', 'metrics', '+' })
+	local view_lit_plus = conn:retained_view({ 'viewlit', 'metrics', Bus.literal('+') })
+	local view_lit_hash_mid = conn:retained_view({ 'viewlit', 'lit', Bus.literal('#'), 'x' })
+
+	assert_eq(table_count(view_wild:snapshot()), 2, 'wild view should include PLUS and ABC')
+	assert(view_wild:get({ 'viewlit', 'metrics', '+' }).payload == 'PLUS')
+	assert(view_wild:get({ 'viewlit', 'metrics', 'abc' }).payload == 'ABC')
+
+	assert_eq(table_count(view_lit_plus:snapshot()), 1, 'literal plus view should include only literal plus')
+	assert(view_lit_plus:get({ 'viewlit', 'metrics', '+' }).payload == 'PLUS')
+	assert(view_lit_plus:get({ 'viewlit', 'metrics', 'abc' }) == nil)
+
+	assert_eq(table_count(view_lit_hash_mid:snapshot()), 1, 'literal hash view should include only literal hash mid-token')
+	assert(view_lit_hash_mid:get({ 'viewlit', 'lit', '#', 'x' }).payload == 'HASHMID')
+
+	view_wild:close()
+	view_lit_plus:close()
+	view_lit_hash_mid:close()
+
+	print('Retained view wildcards + literal tokens test passed!')
+end
+
+local function test_retained_view_changed_op_integer_validation()
+	local bus  = Bus.new({ m_wild = '#', s_wild = '+' })
+	local conn = bus:connect()
+	local view = conn:retained_view({ 'view', 'validation' })
+
+	local bad_values = {
+		nil,
+		1.5,
+		'0',
+		{},
+	}
+
+	for _, v in ipairs(bad_values) do
+		local ok = pcall(function ()
+			view:changed_op(v)
+		end)
+		assert(not ok, 'expected changed_op to reject non-integer last_seen')
+	end
+
+	local ok = pcall(function ()
+		view:changed_op(0)
+	end)
+	assert(ok, 'expected changed_op to accept integer last_seen')
+
+	view:close()
+
+	print('Retained view changed_op integer validation test passed!')
+end
+
+local function test_retained_view_close_and_disconnect()
+	local bus  = Bus.new({ m_wild = '#', s_wild = '+' })
+	local conn = bus:connect()
+
+	local view = conn:retained_view({ 'view', 'close' })
+	assert_eq(bus:stats().retained_views, 1)
+
+	local last = view:version()
+	view:close()
+
+	do
+		local which, version, err = select_named({
+			changed  = view:changed_op(last):wrap(function (v) return v, nil end),
+			deadline = timeout_op(LONG_TMO),
+		})
+		assert_eq(which, 'changed')
+		assert(err == nil)
+		assert(version > last, 'expected close to advance view version')
+	end
+
+	do
+		local reason = fibers.perform(view:closed_op())
+		assert_eq(reason, 'closed')
+	end
+
+	assert_eq(conn:stats().retained_views, 0)
+	assert_eq(bus:stats().retained_views, 0)
+
+	local conn2 = bus:connect()
+	local view2 = conn2:retained_view({ 'view', 'disconnect' })
+	assert_eq(bus:stats().retained_views, 1)
+
+	conn2:disconnect()
+
+	do
+		local reason = fibers.perform(view2:closed_op())
+		assert_eq(reason, 'disconnected')
+	end
+
+	assert_eq(bus:stats().retained_views, 0)
+
+	print('Retained view close + disconnect test passed!')
+end
+
+local function test_retained_view_scope_cleanup()
+	local bus = Bus.new({ m_wild = '#', s_wild = '+' })
+
+	local st, rep = fibers.run_scope(function ()
+		local conn = bus:connect()
+		local view = conn:retained_view({ 'view', 'scope' })
+		assert_eq(conn:stats().retained_views, 1)
+		assert_eq(bus:stats().retained_views, 1)
+		assert(view ~= nil)
+	end)
+
+	assert_eq(st, 'ok', 'expected scope to finish cleanly')
+	assert(rep ~= nil, 'expected scope report')
+	assert_eq(bus:stats().retained_views, 0, 'expected scoped retained view to be removed')
+
+	print('Retained view scope cleanup test passed!')
+end
+
+local function test_retained_view_no_queue_overflow_or_background_fibre()
+	local bus  = Bus.new({ m_wild = '#', s_wild = '+' })
+	local conn = bus:connect()
+
+	for i = 1, 20 do
+		conn:retain({ 'view', 'many', i }, 'V' .. i)
+	end
+
+	local view = conn:retained_view({ 'view', 'many', '#' }, {
+		queue_len = 0,
+		full      = 'reject_newest',
+	})
+
+	assert_eq(table_count(view:snapshot()), 20, 'retained view should materialise all matching retained state')
+	assert_eq(conn:dropped(), 0, 'retained view should not use a lossy mailbox')
+	assert_eq(bus:stats().dropped, 0, 'retained view should not affect bus dropped count')
+	assert_eq(conn:stats().retained_watches, 0, 'retained view should not create retained watch feed')
+	assert_eq(conn:stats().retained_views, 1)
+
+	view:close()
+
+	print('Retained view no queue overflow/background fibre test passed!')
+end
+
+--------------------------------------------------------------------------------
 -- Additional origin / provenance tests
 --------------------------------------------------------------------------------
 
@@ -862,6 +1201,44 @@ local function test_retained_replay_preserves_original_origin()
 	rw:unwatch()
 
 	print('Retained replay preserves original origin test passed!')
+end
+
+local function test_retained_view_preserves_original_origin()
+	local bus = Bus.new({ m_wild = '#', s_wild = '+' })
+
+	local source = bus:connect({
+		principal = admin_principal('view-ret-source'),
+		origin_factory = {
+			kind       = 'fabric_import',
+			link_id    = 'link-view-ret',
+			peer_node  = 'peer-view-ret',
+			peer_sid   = 'sid-view-ret',
+			generation = 18,
+		},
+	})
+
+	source:retain({ 'origin', 'viewret' }, 'VR1', {
+		extra = { trace = 'view-retain-trace' },
+	})
+
+	local view = bus:connect():retained_view({ 'origin', 'viewret' })
+	local msg = view:get({ 'origin', 'viewret' })
+
+	assert(msg and msg.payload == 'VR1', 'expected retained view to contain VR1')
+	assert_origin_fields(msg.origin, {
+		kind       = 'fabric_import',
+		link_id    = 'link-view-ret',
+		peer_node  = 'peer-view-ret',
+		peer_sid   = 'sid-view-ret',
+		generation = 18,
+	})
+	assert_eq(msg.origin.extra.trace, 'view-retain-trace')
+	assert_origin_immutable(msg.origin)
+	assert_origin_extra_immutable(msg.origin)
+
+	view:close()
+
+	print('Retained view preserves original origin test passed!')
 end
 
 local function test_unretain_event_origin_metadata()
@@ -1142,6 +1519,8 @@ local function test_request_done_state_for_fail_and_abandon()
 	local req = Bus.Request and Bus.Request or error('Bus.Request missing')
 	local origin = setmetatable({}, { __index = { kind = 'local' }, __newindex = function () error('immutable') end })
 	local r = req.__index and nil
+	assert(origin ~= nil and r == nil)
+
 	-- Use the real command plane instead of constructing Request internals directly.
 	local bus    = Bus.new({ m_wild = '#', s_wild = '+' })
 	local server = bus:connect()
@@ -1681,9 +2060,15 @@ local function test_authz_denies_without_admin_role()
 	assert(tostring(err5):match('permission denied'), tostring(err5))
 
 	local ok6, err6 = pcall(function()
+		conn_viewer:retained_view({ 'authz', 'deny', 'view' })
+	end)
+	assert(not ok6, 'expected retained_view without admin role to be denied')
+	assert(tostring(err6):match('permission denied'), tostring(err6))
+
+	local ok7, err7 = pcall(function()
 		conn_viewer:derive()
 	end)
-	assert(ok6, 'expected derive itself not to be authoriser-gated: ' .. tostring(err6))
+	assert(ok7, 'expected derive itself not to be authoriser-gated: ' .. tostring(err7))
 
 	print('Authz deny test passed!')
 end
@@ -1752,6 +2137,15 @@ local function test_authz_admin_allows_and_records_actions()
 
 	rw:unwatch()
 
+	-- retained_view is authorised as watch_retained.
+	local view = conn1:retained_view({ 'authz', 'view' })
+	conn1:retain({ 'authz', 'view' }, 'VW')
+	do
+		local msg = view:get({ 'authz', 'view' })
+		assert(msg and msg.payload == 'VW', 'expected authorised retained view to observe retained state')
+	end
+	view:close()
+
 	-- bind + call
 	local rpc_ep = conn2:bind({ 'authz', 'rpc' }, { queue_len = 1 })
 	fibers.spawn(function()
@@ -1808,9 +2202,21 @@ fibers.run(function ()
 	test_retained_watch_replay_done_empty()
 	test_retained_watch_replay_overflow_closes_watch()
 
+	test_feed_distinct_metatables_and_method_guards()
+	test_feed_closed_op_reason()
+
+	test_retained_view_empty_replay_ready()
+	test_retained_view_replay_snapshot_and_live_changes()
+	test_retained_view_wildcards_and_literal_tokens()
+	test_retained_view_changed_op_integer_validation()
+	test_retained_view_close_and_disconnect()
+	test_retained_view_scope_cleanup()
+	test_retained_view_no_queue_overflow_or_background_fibre()
+
 	test_origin_factory_function_and_extra_on_publish()
 	test_origin_conn_ids_distinct_between_connections()
 	test_retained_replay_preserves_original_origin()
+	test_retained_view_preserves_original_origin()
 	test_unretain_event_origin_metadata()
 	test_call_request_origin_factory_and_extra()
 
