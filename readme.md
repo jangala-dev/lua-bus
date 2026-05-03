@@ -8,32 +8,39 @@ It is intended for cooperative, single-threaded systems running under `fibers.ru
 
 - delivery is **bounded**: every subscription, retained watch, and endpoint has a finite queue, which may be zero-length
 - routing is **non-blocking**: a slow consumer does not stall publishers or callers
+- retained observation can be either **feed-based** or **materialised** through a versioned retained view
 
-The bus exposes two public planes only:
+The bus exposes two public planes:
 
-- a **state/event plane** for publish/subscribe and retained state
+- a **state/event plane** for publish/subscribe, retained state, retained lifecycle feeds, and retained materialised views
 - a **command plane** for concrete point-to-point request/reply
 
-That gives a small, explicit programming model:
+That gives a small programming model:
 
 - **publish** facts
 - **retain** current truth
+- **observe** retained truth
 - **call** owned actions
 
 The bus also attaches immutable, bus-owned provenance (`origin`) to delivered values, so higher layers such as `fabric` can reason about source and session without relying on payload conventions.
 
 ## Internal indexes
 
-The bus uses three tries:
+The bus uses trie-based topic indexes:
 
 - a **pubsub trie** for ordinary subscriptions
-  wildcards are allowed in stored subscription patterns; published topics are concrete queries
+  Wildcards are allowed in stored subscription patterns; published topics are concrete queries.
 
 - a **retained trie** for retained state
-  retained topics are stored as concrete keys; subscriptions and retained watches may query with wildcards
+  Retained topics are stored as concrete keys; subscriptions, retained watches, and retained views may query with wildcards.
 
 - a **retained-watch trie** for retained lifecycle feeds
-  wildcards are allowed in stored watch patterns; retained writes and removals are concrete queries
+  Wildcards are allowed in stored watch patterns; retained writes and removals are concrete queries.
+
+- a **retained-view trie** for retained materialised views
+  Wildcards are allowed in stored view patterns; retained writes and removals are concrete queries.
+
+Retained materialised views observe retained state directly and maintain a local versioned snapshot for event-driven assertions and observation.
 
 Endpoints are stored separately in a concrete-topic registry.
 
@@ -41,7 +48,7 @@ Endpoints are stored separately in a concrete-topic registry.
 
 ### Bus
 
-The shared router, retained store, endpoint registry, and retained-watch registry.
+The shared router, retained store, endpoint registry, retained-watch registry, and retained-view observer owner.
 
 ### Connection
 
@@ -57,13 +64,21 @@ A bounded mailbox receiving ordinary published `Message` values.
 
 A bounded mailbox receiving retained-state lifecycle `RetainedEvent` values.
 
+### RetainedView
+
+A versioned materialised view of retained state matching a topic pattern.
+
+Unlike `RetainedWatch`, a retained view is not a queue. It does not expose every retained lifecycle event. It maintains the latest matching retained messages and provides `changed_op(last_seen)` so callers can wait for the view version to change or for the view to close.
+
+This is useful for tests, probes, health reporting, and components that care about current retained truth rather than every lifecycle event.
+
 ### Endpoint
 
 A bounded mailbox receiving concrete point-to-point `Request` values.
 
 ### Message
 
-Delivered to ordinary subscriptions:
+Delivered to ordinary subscriptions and stored in retained views:
 
 ```lua
 {
@@ -126,7 +141,7 @@ Immutable provenance attached by the bus:
 
 For ordinary local traffic, only some fields are populated. Fields such as `link_id`, `peer_node`, `peer_sid`, and `generation` are intended for provenance-aware federation layers such as `fabric`.
 
-The bus owns trusted provenance fields. Callers may attach only `origin.extra` through publish/retain/unretain/call options.
+The bus owns trusted provenance fields. Callers may attach only `origin.extra` through publish, retain, unretain, and call options.
 
 ## Assumptions and semantics
 
@@ -134,10 +149,13 @@ The bus owns trusted provenance fields. Callers may attach only `origin.extra` t
 * Delivery is always bounded.
 * The bus never uses blocking queue policy.
 * Slow consumers lose data according to their mailbox policy; they do not stall the system.
-* Timeouts are not built into subscriptions or retained watches; compose them externally with `fibers.choice`, `fibers.named_choice`, and `fibers.sleep.sleep_op(...)`.
+* Timeouts are not built into subscriptions, retained watches, or retained views; compose them externally with `fibers.choice`, `fibers.named_choice`, and `fibers.sleep.sleep_op(...)`.
 * `call(...)` supports timeout/deadline directly because bounded request/reply is part of the command plane.
 * Origins are immutable once created.
 * `origin.extra`, if present, is immutable too.
+* Retained views are versioned snapshots, not event logs.
+* Retained views do not use a mailbox and therefore do not have queue overflow semantics.
+* A retained view’s `changed_op(last_seen)` is close-aware.
 
 ## Topics, wildcards, and literals
 
@@ -151,7 +169,7 @@ Tokens must be strings or numbers.
 
 ### Wildcards
 
-Subscription and retained-watch patterns may use:
+Subscription, retained-watch, and retained-view patterns may use:
 
 * single-level wildcard: `+`
 * multi-level wildcard: `#`
@@ -160,7 +178,7 @@ These tokens are configurable with `s_wild` and `m_wild`.
 
 ### Literal wildcard tokens
 
-If the wildcard symbols must be treated as ordinary literal topic elements, wrap them with `bus.literal(...)`:
+If the wildcard symbols must be treated as ordinary literal topic elements, wrap them with `Bus.literal(...)`:
 
 ```lua
 local Bus = require 'bus'
@@ -174,6 +192,7 @@ A literal wildcard token is treated as concrete for:
 * point-to-point calls
 * ordinary literal matching
 * retained matching
+* retained views
 
 ## Delivery, queues, and full policy
 
@@ -182,10 +201,12 @@ Each subscription, retained watch, and endpoint mailbox has:
 * `queue_len` — integer, `>= 0`
 * `full` policy:
 
-  * `"drop_oldest"` (default)
+  * `"drop_oldest"` default
   * `"reject_newest"`
 
 `"block"` is rejected. The bus is intentionally bounded and non-blocking.
+
+Retained views are not mailboxes and do not take queue policy for delivery. They hold the current matching retained state and expose changes through a version counter.
 
 ### Queue length `0`
 
@@ -198,7 +219,7 @@ This can be useful for highly transient traffic where stale queueing is undesira
 
 ### Drop accounting
 
-Drops are tracked per handle and in aggregate:
+Drops are tracked per queued handle and in aggregate:
 
 * `sub:dropped()`
 * `watch:dropped()`
@@ -208,8 +229,10 @@ Drops are tracked per handle and in aggregate:
 
 The count includes both:
 
-* buffered evictions under `"drop_oldest"`, and
+* buffered evictions under `"drop_oldest"`
 * admission failures under `"reject_newest"`
+
+Retained views do not contribute to drop counts.
 
 ## State/event plane
 
@@ -220,6 +243,7 @@ The state/event plane consists of:
 * `unretain`
 * `subscribe`
 * `watch_retained`
+* `retained_view`
 
 ### Ordinary publish
 
@@ -238,10 +262,11 @@ A retained write:
 conn:retain({ 'fw', 'version' }, '1.2.3')
 ```
 
-does two things:
+does three things:
 
-1. it publishes the message to matching ordinary subscriptions
-2. it stores the retained value under that concrete topic
+1. publishes the message to matching ordinary subscriptions
+2. stores the retained value under that concrete topic
+3. updates matching retained watches and retained views
 
 A retained removal:
 
@@ -249,7 +274,7 @@ A retained removal:
 conn:unretain({ 'fw', 'version' })
 ```
 
-removes the retained value. It does not publish an ordinary message.
+removes the retained value and updates matching retained watches and retained views. It does not publish an ordinary message.
 
 ### Retained lifecycle feeds
 
@@ -288,7 +313,7 @@ On replay completion:
 }
 ```
 
-Retained watches are independent of ordinary subscriptions.
+Retained watches are independent of ordinary subscriptions and retained views.
 
 ### Replay on retained watch creation
 
@@ -297,6 +322,62 @@ Retained watches are independent of ordinary subscriptions.
 This marker means the initial replay scan has completed. It does **not** imply global quiescence. Live retained updates may occur while replay is in progress and may be observed before or after `replay_done`, depending on timing.
 
 If the bus cannot deliver `replay_done`, the watch is closed rather than silently dropping the marker.
+
+### Retained materialised views
+
+A retained view gives a current snapshot of retained state matching a pattern:
+
+```lua
+local view = conn:retained_view({ 'config', '#' })
+```
+
+It is immediately initialised from the retained trie and then kept current by subsequent `retain` and `unretain` operations.
+
+A view has a monotonically increasing integer version:
+
+```lua
+local version = view:version()
+```
+
+Wait for it to change or close:
+
+```lua
+local new_version, err = fibers.perform(view:changed_op(version))
+
+if new_version then
+  version = new_version
+else
+  print('view closed:', err)
+end
+```
+
+The return shape is:
+
+```text
+version, nil  -- retained view changed
+nil, reason   -- retained view closed
+```
+
+Read one retained message:
+
+```lua
+local msg = view:get({ 'config', 'network' })
+if msg then
+  print(msg.payload)
+end
+```
+
+Read all retained messages currently in the view:
+
+```lua
+local snapshot = view:snapshot()
+```
+
+`snapshot()` returns an array of `Message` objects. It does not expose the bus’s internal topic-key map. The array is sorted deterministically by the internal topic key so that tests and diagnostics can compare it reliably.
+
+`items()` is an alias for `snapshot()` and also returns an array.
+
+A retained view is useful when the consumer wants current truth rather than a lifecycle event stream. Changes may be coalesced between observations; the version tells you that the view changed, not how many individual retained operations occurred.
 
 ## Command plane
 
@@ -309,7 +390,7 @@ A call targets exactly one concrete endpoint topic.
 
 Endpoint handlers do not reply by publishing to reply topics. They receive a `Request` object and complete it directly with:
 
-* `req:reply(value)`, or
+* `req:reply(value)`
 * `req:fail(err)`
 
 The bus may also abandon a request internally when the caller times out or aborts. Endpoint code should therefore treat `req:reply(...) == false` or `req:fail(...) == false` as a normal outcome.
@@ -325,7 +406,7 @@ Bound endpoints are point-to-point and admission-signalled:
 * if the endpoint closes before replying, the caller sees `closed`
 * if the deadline expires first, the caller sees `timeout`
 
-Exact error values depend on the bus implementation, but these are the intended categories.
+Exact error values depend on the close reason, but these are the intended categories.
 
 ## Derived connections
 
@@ -418,6 +499,7 @@ State/event plane:
 * `conn:unsubscribe(sub) -> true`
 * `conn:watch_retained(topic[, opts]) -> watch`
 * `conn:unwatch_retained(watch) -> true`
+* `conn:retained_view(topic[, opts]) -> view`
 
 Command plane:
 
@@ -435,11 +517,18 @@ Lifecycle and stats:
 * `conn:dropped() -> integer`
 * `conn:stats() -> table`
 
-Per-operation options for `publish`, `retain`, `unretain`, and `call`:
+Options for `publish`, `retain`, `unretain`, and `call`:
 
 ```lua
 {
-  extra?    = table,
+  extra? = table,
+}
+```
+
+Additional options for `call`:
+
+```lua
+{
   timeout?  = number,
   deadline? = number,
 }
@@ -452,10 +541,13 @@ Per-operation options for `publish`, `retain`, `unretain`, and `call`:
 * `sub:recv_op() -> Op` yielding `(Message|nil, err|string|nil)`
 * `sub:recv() -> Message|nil, err|string|nil`
 * `sub:unsubscribe() -> true`
+* `sub:close() -> true`
+* `sub:closed_op() -> Op` yielding `reason`
 * `sub:iter() -> iterator<Message>`
 * `sub:payloads() -> iterator<any>`
 * `sub:why() -> any|nil`
 * `sub:dropped() -> integer`
+* `sub:kind() -> "subscription"`
 * `sub:topic() -> Topic`
 * `sub:stats() -> table`
 
@@ -464,11 +556,43 @@ Per-operation options for `publish`, `retain`, `unretain`, and `call`:
 * `watch:recv_op() -> Op` yielding `(RetainedEvent|nil, err|string|nil)`
 * `watch:recv() -> RetainedEvent|nil, err|string|nil`
 * `watch:unwatch() -> true`
+* `watch:close() -> true`
+* `watch:closed_op() -> Op` yielding `reason`
 * `watch:iter() -> iterator<RetainedEvent>`
 * `watch:why() -> any|nil`
 * `watch:dropped() -> integer`
+* `watch:kind() -> "retained_watch"`
 * `watch:topic() -> Topic`
 * `watch:stats() -> table`
+
+### RetainedView
+
+* `view:version() -> integer`
+* `view:changed_op(last_seen) -> Op` yielding `(new_version|nil, err|string|nil)`
+* `view:get(topic) -> Message|nil`
+* `view:snapshot() -> Message[]`
+* `view:items() -> Message[]`
+* `view:close() -> true`
+* `view:closed_op() -> Op` yielding `reason`
+
+`changed_op(last_seen)` requires `last_seen` to be an integer. If the view version already differs from `last_seen`, it is ready immediately.
+
+Return shape:
+
+```text
+new_version, nil  -- changed
+nil, reason       -- closed
+```
+
+`snapshot()` and `items()` return an array, not a map. Each entry is a `Message`:
+
+```lua
+{
+  topic   = <Topic>,
+  payload = <any>,
+  origin  = <Origin>,
+}
+```
 
 ### Endpoint
 
@@ -476,9 +600,13 @@ Per-operation options for `publish`, `retain`, `unretain`, and `call`:
 * `ep:recv() -> Request|nil, err|string|nil`
 * `ep:iter() -> iterator<Request>`
 * `ep:unbind() -> true`
+* `ep:close() -> true`
+* `ep:closed_op() -> Op` yielding `reason`
 * `ep:why() -> any|nil`
 * `ep:dropped() -> integer`
+* `ep:kind() -> "endpoint"`
 * `ep:topic() -> Topic`
+* `ep:stats() -> table`
 
 ### Request
 
@@ -629,7 +757,7 @@ local sub = conn:subscribe(
 
 ### Compose a timeout
 
-Subscriptions and retained watches do not have built-in timeouts. Compose them externally:
+Subscriptions, retained watches, and retained views do not have built-in timeouts. Compose them externally:
 
 ```lua
 local fibers = require 'fibers'
@@ -641,6 +769,25 @@ local which, msg, err = fibers.perform(fibers.named_choice{
     return nil, 'timeout'
   end),
 })
+```
+
+For a retained view, the changed arm itself may also report closure:
+
+```lua
+local which, new_version, err = fibers.perform(fibers.named_choice{
+  changed  = view:changed_op(version),
+  deadline = sleep.sleep_op(1.0):wrap(function ()
+    return nil, 'timeout'
+  end),
+})
+
+if which == 'changed' and new_version then
+  version = new_version
+elseif which == 'changed' then
+  print('view closed:', err)
+else
+  print('timed out')
+end
 ```
 
 ### Watch retained state
@@ -669,6 +816,64 @@ else
   print('watch closed:', err)
 end
 ```
+
+### Use a retained view
+
+```lua
+local view = conn:retained_view({ 'config', '#' })
+
+local version = view:version()
+local snapshot = view:snapshot()
+
+local msg = view:get({ 'config', 'network' })
+if msg then
+  print('network config:', msg.payload)
+end
+
+local new_version, err = fibers.perform(view:changed_op(version))
+if new_version then
+  print('retained view changed:', new_version)
+else
+  print('retained view closed:', err)
+end
+```
+
+Iterate over a snapshot:
+
+```lua
+for _, msg in ipairs(view:snapshot()) do
+  print(table.concat(msg.topic, '/'), msg.payload)
+end
+```
+
+A typical loop:
+
+```lua
+local version = view:version()
+
+while true do
+  local which, new_version_or_status, err_or_reason = fibers.perform(fibers.named_choice{
+    changed = view:changed_op(version),
+    stop    = scope:cancel_op(),
+  })
+
+  if which == 'stop' then
+    return
+  end
+
+  if new_version_or_status == nil then
+    local close_reason = err_or_reason
+    return nil, close_reason
+  end
+
+  version = new_version_or_status
+
+  local snapshot = view:snapshot()
+  -- Recompute from current retained truth.
+end
+```
+
+Because `changed_op(...)` is close-aware, most loops do not need to race it separately against `view:closed_op()`. `closed_op()` remains useful when code only cares about closure.
 
 ### Bind an endpoint and handle requests
 
@@ -716,14 +921,17 @@ local value, err = conn:call({ 'rpc', 'echo' }, 'hello', {
 
 Point-to-point topics must be concrete. Wildcards are rejected, though literal wildcard tokens wrapped with `Bus.literal(...)` are allowed.
 
-### Unsubscribe, unwatch, unbind, disconnect
+### Unsubscribe, unwatch, close, unbind, disconnect
 
 ```lua
 sub:unsubscribe()
 watch:unwatch()
+view:close()
 ep:unbind()
 conn:disconnect()
 ```
+
+Queued feed handles also support `close()` as a generic close operation.
 
 All are intended to be idempotent and to wake blocked receivers promptly.
 
@@ -749,7 +957,7 @@ The authoriser receives a context such as:
 }
 ```
 
-Actions in the simplified API are:
+Actions are:
 
 * `publish`
 * `retain`
@@ -758,6 +966,8 @@ Actions in the simplified API are:
 * `watch_retained`
 * `bind`
 * `call`
+
+In the current implementation, `retained_view(...)` is authorised using the same `watch_retained` action as retained lifecycle watches, because both are retained-state observation capabilities.
 
 If authorisation fails, the attempted operation raises an error.
 
@@ -771,6 +981,7 @@ If authorisation fails, the attempted operation raises an error.
   subscriptions    = ...,
   endpoints        = ...,
   retained_watches = ...,
+  retained_views   = ...,
 }
 ```
 
@@ -785,25 +996,33 @@ If authorisation fails, the attempted operation raises an error.
   s_wild           = ...,
   m_wild           = ...,
   retained_watches = ...,
+  retained_views   = ...,
   endpoints        = ...,
 }
 ```
+
+Retained views are observational objects and do not contribute to queue drop counts.
 
 ## Notes and limitations
 
 * Delivery is best-effort and bounded; drops under load are expected.
 * Retained replay to new subscriptions is bounded and best-effort.
 * Retained-watch replay is bounded; if the bus cannot deliver the terminal `replay_done` marker, the watch is closed.
+* Retained views represent current retained truth, not every lifecycle event.
+* Retained views coalesce changes by design; use retained watches when every retain/unretain event matters.
+* Retained view snapshots are arrays of `Message` objects, not maps keyed by internal topic strings.
+* `changed_op(last_seen)` is close-aware and returns either a new version or a close reason.
 * `full = "block"` is intentionally unsupported.
 * Ordinary subscriptions observe published messages.
 * Retained watches observe retained-state lifecycle.
+* Retained views observe retained-state truth.
 * Endpoints carry command requests only; they are not part of ordinary pub/sub.
 * Origin metadata is part of bus semantics, not an application payload convention.
 * `derive()` creates a sibling connection without exposing the bus object.
 
 ## Design summary
 
-The bus intentionally exposes only two public interaction styles.
+The bus intentionally exposes a small set of interaction styles.
 
 ### State/event plane
 
@@ -812,6 +1031,7 @@ The bus intentionally exposes only two public interaction styles.
 * `unretain`
 * `subscribe`
 * `watch_retained`
+* `retained_view`
 
 ### Command plane
 
@@ -822,6 +1042,7 @@ That gives a small, teachable model:
 
 * publish facts
 * retain current truth
+* observe current truth or retained lifecycle
 * call owned actions
 
 while keeping provenance available for observability, policy, and federation layers such as `fabric`.
