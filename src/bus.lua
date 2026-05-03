@@ -881,7 +881,7 @@ function RetainedView:changed_op(last_seen)
 		return op.always(nil, why)
 	end
 
-	if self._version ~= last_seen then
+	if self._version > last_seen then
 		return op.always(self._version, nil)
 	end
 
@@ -895,20 +895,21 @@ function RetainedView:changed_op(last_seen)
 	end)
 end
 
-function RetainedView:get(topic)
-	assert_topic(topic, 'topic', 2)
-	return self._items[topic_key(topic)]
+local function copy_msg(msg)
+	if not msg then return nil end
+	return new_msg(msg.topic, msg.payload, msg.origin)
 end
 
---- Return a deterministic array of retained Message objects in this view.
----
---- This deliberately does not expose the bus's internal topic_key() map.
----@return Message[]
+function RetainedView:get(topic)
+	assert_topic(topic, 'topic', 2)
+	return copy_msg(self._items[topic_key(topic)])
+end
+
 function RetainedView:snapshot()
 	local out = {}
 
 	for _, msg in pairs(self._items) do
-		out[#out + 1] = msg
+		out[#out + 1] = copy_msg(msg)
 	end
 
 	table.sort(out, function (a, b)
