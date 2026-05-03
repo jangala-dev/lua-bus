@@ -771,18 +771,9 @@ local function retained_view_bump(self)
 end
 
 local function retained_view_set_msg(self, msg)
-	local key = topic_key(msg.topic)
-	local old = self._items[key]
-
-	if old
-		and old.payload == msg.payload
-		and old.origin == msg.origin
-	then
-		return
-	end
-
-	self._items[key] = new_msg(msg.topic, msg.payload, msg.origin)
-	retained_view_bump(self)
+  local key = topic_key(msg.topic)
+  self._items[key] = new_msg(msg.topic, msg.payload, msg.origin)
+  retained_view_bump(self)
 end
 
 local function retained_view_delete_topic(self, topic)
