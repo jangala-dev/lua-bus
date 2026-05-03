@@ -892,15 +892,27 @@ local function test_retained_view_wildcards_and_literal_tokens()
 	local view_lit_hash_mid = conn:retained_view({ 'viewlit', 'lit', Bus.literal('#'), 'x' })
 
 	assert_eq(#view_wild:snapshot(), 2, 'wild view should include PLUS and ABC')
-	assert(view_wild:get({ 'viewlit', 'metrics', '+' }).payload == 'PLUS')
+	assert(view_wild:get({ 'viewlit', 'metrics', Bus.literal('+') }).payload == 'PLUS')
 	assert(view_wild:get({ 'viewlit', 'metrics', 'abc' }).payload == 'ABC')
 
 	assert_eq(#view_lit_plus:snapshot(), 1, 'literal plus view should include only literal plus')
-	assert(view_lit_plus:get({ 'viewlit', 'metrics', '+' }).payload == 'PLUS')
+	assert(view_lit_plus:get({ 'viewlit', 'metrics', Bus.literal('+') }).payload == 'PLUS')
 	assert(view_lit_plus:get({ 'viewlit', 'metrics', 'abc' }) == nil)
 
 	assert_eq(#view_lit_hash_mid:snapshot(), 1, 'literal hash view should include only literal hash mid-token')
-	assert(view_lit_hash_mid:get({ 'viewlit', 'lit', '#', 'x' }).payload == 'HASHMID')
+	assert(view_lit_hash_mid:get({ 'viewlit', 'lit', Bus.literal('#'), 'x' }).payload == 'HASHMID')
+
+	local ok, err = pcall(function()
+		view_wild:get({ 'viewlit', 'metrics', '+' })
+	end)
+	assert(not ok, 'retained_view:get should reject wildcard lookup topics')
+	assert(tostring(err):match('concrete topic'), 'error should explain concrete-topic requirement')
+
+	ok, err = pcall(function()
+		view_lit_hash_mid:get({ 'viewlit', 'lit', '#', 'x' })
+	end)
+	assert(not ok, 'retained_view:get should reject wildcard lookup topics')
+	assert(tostring(err):match('concrete topic'), 'error should explain concrete-topic requirement')
 
 	view_wild:close()
 	view_lit_plus:close()

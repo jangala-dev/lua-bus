@@ -892,8 +892,12 @@ local function copy_msg(msg)
 end
 
 function RetainedView:get(topic)
-	assert_topic(topic, 'topic', 2)
-	return copy_msg(self._items[topic_key(topic)])
+  assert_topic(topic, 'topic', 2)
+  local bus = self._bus or (self._conn and self._conn._bus)
+  if bus then
+    assert_concrete_topic(bus._s_wild, bus._m_wild, topic, 'retained_view:get topic', 2)
+  end
+  return copy_msg(self._items[topic_key(topic)])
 end
 
 function RetainedView:snapshot()
