@@ -1545,6 +1545,108 @@ local function test_request_done_state_for_fail_and_abandon()
 	print('Request done state for fail/abandon test passed!')
 end
 
+
+local function test_request_status_and_done_op_for_all_terminal_states()
+	local bus    = Bus.new({ m_wild = '#', s_wild = '+' })
+	local server = bus:connect()
+	local client = bus:connect()
+
+	local ep = server:bind({ 'rpc', 'status' }, { queue_len = 3 })
+
+	fibers.spawn(function ()
+		local req = assert(ep:recv())
+		assert_eq(select(1, req:status()), 'pending')
+		assert(req:reply('ok'))
+	end)
+	local v, err = client:call({ 'rpc', 'status' }, 'reply', { timeout = LONG_TMO })
+	assert_eq(v, 'ok')
+	assert(err == nil, tostring(err))
+
+	fibers.spawn(function ()
+		local req = assert(ep:recv())
+		assert(req:fail('bad'))
+		local status, value, ferr = fibers.perform(req:done_op())
+		assert_eq(status, 'failed')
+		assert(value == nil)
+		assert_eq(ferr, 'bad')
+	end)
+	v, err = client:call({ 'rpc', 'status' }, 'fail', { timeout = LONG_TMO })
+	assert(v == nil)
+	assert_eq(err, 'bad')
+
+	local abandoned = Channel.new(1)
+	fibers.spawn(function ()
+		local req = assert(ep:recv())
+		local status, value, aerr = fibers.perform(req:done_op())
+		abandoned:put({ status = status, value = value, err = aerr })
+	end)
+	v, err = client:call({ 'rpc', 'status' }, 'abandon', { timeout = TMO })
+	assert(v == nil)
+	assert_eq(err, 'timeout')
+	local rec = abandoned:get()
+	assert_eq(rec.status, 'abandoned')
+	assert(rec.value == nil)
+	assert_eq(rec.err, 'timeout')
+
+	print('Request status and done_op terminal-state test passed!')
+end
+
+local function test_call_op_abort_abandons_request_and_wakes_done_op()
+	local bus    = Bus.new({ m_wild = '#', s_wild = '+' })
+	local server = bus:connect()
+	local client = bus:connect()
+	local ep     = server:bind({ 'rpc', 'abort' }, { queue_len = 1 })
+	local seen   = Channel.new(1)
+
+	fibers.spawn(function ()
+		local req = assert(ep:recv())
+		local status, value, err = fibers.perform(req:done_op())
+		seen:put({ status = status, value = value, err = err, late_reply = req:reply('late') })
+	end)
+
+	local which, value, err = select_named({
+		call = client:call_op({ 'rpc', 'abort' }, 'payload', { timeout = false }),
+		stop = timeout_op(TMO),
+	})
+	assert_eq(which, 'stop')
+	assert(value == nil)
+	assert_eq(err, 'timeout')
+
+	local rec = seen:get()
+	assert_eq(rec.status, 'abandoned')
+	assert(rec.value == nil)
+	assert_eq(rec.err, 'aborted')
+	assert_eq(rec.late_reply, false)
+
+	print('call_op abort abandons request and wakes done_op test passed!')
+end
+
+local function test_call_op_timeout_false_has_no_hidden_deadline()
+	local bus    = Bus.new({ m_wild = '#', s_wild = '+' })
+	local server = bus:connect()
+	local client = bus:connect()
+	local ep     = server:bind({ 'rpc', 'no-hidden-timeout' }, { queue_len = 1 })
+	local done   = Channel.new(1)
+
+	fibers.spawn(function ()
+		local req = assert(ep:recv())
+		local status, _value, err = fibers.perform(req:done_op())
+		done:put({ status = status, err = err })
+	end)
+
+	local which = select_named({
+		call = client:call_op({ 'rpc', 'no-hidden-timeout' }, 'payload', { timeout = false }),
+		stop = timeout_op(TMO),
+	})
+	assert_eq(which, 'stop')
+
+	local rec = done:get()
+	assert_eq(rec.status, 'abandoned')
+	assert_eq(rec.err, 'aborted')
+
+	print('call_op timeout=false no-hidden-deadline test passed!')
+end
+
 --------------------------------------------------------------------------------
 -- Unsubscribe Test
 --------------------------------------------------------------------------------
@@ -2221,6 +2323,9 @@ fibers.run(function ()
 
 	test_request_abandon_after_timeout_rejects_late_reply()
 	test_request_done_state_for_fail_and_abandon()
+	test_request_status_and_done_op_for_all_terminal_states()
+	test_call_op_abort_abandons_request_and_wakes_done_op()
+	test_call_op_timeout_false_has_no_hidden_deadline()
 
 	test_q_overflow_drop_oldest_default()
 	test_q_overflow_reject_newest_override()

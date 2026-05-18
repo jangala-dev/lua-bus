@@ -471,6 +471,7 @@ end
 ---@field origin Origin
 ---@field _cond Cond
 ---@field _done boolean
+---@field _status string
 ---@field _ok boolean|nil
 ---@field _value any
 ---@field _err any
@@ -488,6 +489,7 @@ local function new_request(topic, payload, origin)
 		origin  = origin,
 		_cond   = cond.new(),
 		_done   = false,
+		_status = 'pending',
 		_ok     = nil,
 		_value  = nil,
 		_err    = nil,
@@ -499,8 +501,9 @@ end
 function Request:reply(value)
 	if self._done then return false end
 
-	self._done  = true
-	self._ok    = true
+	self._done   = true
+	self._status = 'replied'
+	self._ok     = true
 	self._value = value
 	self._err   = nil
 	self._cond:signal()
@@ -513,10 +516,11 @@ end
 function Request:fail(err)
 	if self._done then return false end
 
-	self._done  = true
-	self._ok    = false
-	self._value = nil
-	self._err   = err
+	self._done   = true
+	self._status = 'failed'
+	self._ok     = false
+	self._value  = nil
+	self._err    = err
 	self._cond:signal()
 
 	return true
@@ -527,10 +531,11 @@ end
 function Request:abandon(reason)
 	if self._done then return false end
 
-	self._done  = true
-	self._ok    = false
-	self._value = nil
-	self._err   = reason or 'abandoned'
+	self._done   = true
+	self._status = 'abandoned'
+	self._ok     = false
+	self._value  = nil
+	self._err    = reason or 'abandoned'
 	self._cond:signal()
 
 	return true
@@ -539,6 +544,24 @@ end
 ---@return boolean
 function Request:done()
 	return self._done
+end
+
+---@return string status
+---@return any value
+---@return any err
+function Request:status()
+	return self._status or 'pending', self._value, self._err
+end
+
+---@return Op
+function Request:done_op()
+	if self._done then
+		return op.always(self:status())
+	end
+
+	return self._cond:wait_op():wrap(function ()
+		return self:status()
+	end)
 end
 
 ---@return Op
@@ -1389,6 +1412,10 @@ local function call_result_op(req, deadline)
 		return req:wait_reply_op()
 	end
 
+	if deadline == false then
+		return req:wait_reply_op()
+	end
+
 	local now = runtime.now()
 	if deadline <= now then
 		req:abandon('timeout')
@@ -1425,9 +1452,10 @@ function Connection:call_op(topic, payload, opts)
 			return op.always(nil, 'no_route')
 		end
 
-		local timeout  = (type(opts.timeout) == 'number') and opts.timeout or 1.0
-		local deadline = (type(opts.deadline) == 'number') and opts.deadline or (runtime.now() + timeout)
-		local req      = new_request(topic, payload, build_origin(self, opts.extra))
+		local no_timeout = opts.timeout == false or opts.deadline == false
+		local timeout    = (type(opts.timeout) == 'number') and opts.timeout or 1.0
+		local deadline   = no_timeout and false or ((type(opts.deadline) == 'number') and opts.deadline or (runtime.now() + timeout))
+		local req        = new_request(topic, payload, build_origin(self, opts.extra))
 
 		local ok, reason = mailbox_try_send(ep._tx, req)
 		if ok ~= true then
