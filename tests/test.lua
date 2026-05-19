@@ -1647,6 +1647,74 @@ local function test_call_op_timeout_false_has_no_hidden_deadline()
 	print('call_op timeout=false no-hidden-deadline test passed!')
 end
 
+local function test_call_no_timeout_options_survive_default_deadline()
+	local bus    = Bus.new({ m_wild = '#', s_wild = '+' })
+	local server = bus:connect()
+	local client = bus:connect()
+	local ep     = server:bind({ 'rpc', 'no-default-deadline' }, { queue_len = 3 })
+	local results = Channel.new(3)
+
+	fibers.spawn(function ()
+		for _ = 1, 3 do
+			local req = assert(ep:recv())
+			fibers.spawn(function ()
+				-- The bus default call timeout is one second.  Sleeping slightly longer
+				-- proves that timeout=false/deadline=false really disables that
+				-- hidden deadline rather than merely racing a shorter outer abort.
+				fibers.perform(Sleep.sleep_op(1.1))
+				assert(req:reply('reply:' .. tostring(req.payload)))
+			end)
+		end
+	end)
+
+	fibers.spawn(function ()
+		local value, err = fibers.perform(client:call_op(
+			{ 'rpc', 'no-default-deadline' },
+			'timeout_false_op',
+			{ timeout = false }
+		))
+		results:put({ case = 'timeout_false_op', value = value, err = err })
+	end)
+
+	fibers.spawn(function ()
+		local value, err = fibers.perform(client:call_op(
+			{ 'rpc', 'no-default-deadline' },
+			'deadline_false_op',
+			{ deadline = false }
+		))
+		results:put({ case = 'deadline_false_op', value = value, err = err })
+	end)
+
+	fibers.spawn(function ()
+		local value, err = client:call(
+			{ 'rpc', 'no-default-deadline' },
+			'timeout_false_call',
+			{ timeout = false }
+		)
+		results:put({ case = 'timeout_false_call', value = value, err = err })
+	end)
+
+	local got = {}
+	for _ = 1, 3 do
+		local which, rec, err = select_named({
+			result   = results:get_op():wrap(function (v) return v, nil end),
+			deadline = timeout_op(1.7),
+		})
+		assert_eq(which, 'result', 'expected no-timeout call result before outer deadline')
+		assert(err == nil, tostring(err))
+		got[rec.case] = rec
+	end
+
+	for _, case in ipairs({ 'timeout_false_op', 'deadline_false_op', 'timeout_false_call' }) do
+		local rec = got[case]
+		assert(rec, 'missing result for ' .. case)
+		assert_eq(rec.value, 'reply:' .. case, case .. ' should survive past bus default timeout')
+		assert_eq(rec.err, nil, case .. ' should not time out')
+	end
+
+	print('call timeout=false/deadline=false no hidden default-deadline test passed!')
+end
+
 --------------------------------------------------------------------------------
 -- Unsubscribe Test
 --------------------------------------------------------------------------------
@@ -2326,6 +2394,7 @@ fibers.run(function ()
 	test_request_status_and_done_op_for_all_terminal_states()
 	test_call_op_abort_abandons_request_and_wakes_done_op()
 	test_call_op_timeout_false_has_no_hidden_deadline()
+	test_call_no_timeout_options_survive_default_deadline()
 
 	test_q_overflow_drop_oldest_default()
 	test_q_overflow_reject_newest_override()

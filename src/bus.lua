@@ -1454,7 +1454,14 @@ function Connection:call_op(topic, payload, opts)
 
 		local no_timeout = opts.timeout == false or opts.deadline == false
 		local timeout    = (type(opts.timeout) == 'number') and opts.timeout or 1.0
-		local deadline   = no_timeout and false or ((type(opts.deadline) == 'number') and opts.deadline or (runtime.now() + timeout))
+		local deadline
+		if no_timeout then
+			deadline = false
+		elseif type(opts.deadline) == 'number' then
+			deadline = opts.deadline
+		else
+			deadline = runtime.now() + timeout
+		end
 		local req        = new_request(topic, payload, build_origin(self, opts.extra))
 
 		local ok, reason = mailbox_try_send(ep._tx, req)
