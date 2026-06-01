@@ -1124,6 +1124,7 @@ end
 ---@field _eps table<Endpoint, boolean>
 ---@field _rws table<RetainedWatch, boolean>
 ---@field _views table<RetainedView, boolean>
+---@field _detach_finaliser function|nil
 ---@field _disconnected boolean
 ---@field _conn_id string
 ---@field _origin_factory table|fun():table
@@ -1146,6 +1147,7 @@ local function new_connection(bus, principal, q_length, full, origin_factory)
 		_eps            = {},
 		_rws            = {},
 		_views          = {},
+		_detach_finaliser = nil,
 		_disconnected   = false,
 		_conn_id        = tostring(uuid.new()),
 		_origin_factory = origin_factory or {},
@@ -1484,6 +1486,7 @@ end
 function Connection:disconnect()
 	if self._disconnected then return true end
 
+	clear_finaliser(self)
 	self._disconnected = true
 
 	local bus = self._bus
@@ -1556,7 +1559,8 @@ function Bus:connect(opts)
 
 	self._conns[conn] = true
 
-	s:finally(function ()
+	conn._detach_finaliser = s:finally(function ()
+		conn._detach_finaliser = nil
 		conn:disconnect()
 	end)
 
