@@ -318,6 +318,35 @@ local function test_conn_clean()
 	print('Connection cleanup test passed!')
 end
 
+
+--------------------------------------------------------------------------------
+-- Test Connection Finaliser Detachment on Explicit Disconnect
+--------------------------------------------------------------------------------
+
+-- Regression test for explicit Connection:disconnect(). Bus:connect()
+-- installs a scope finaliser so that connections are disconnected on scope
+-- exit. Explicit disconnect must detach that finaliser immediately; otherwise
+-- long-lived scopes retain one finaliser closure, and therefore one connection
+-- object, for every connection ever opened and disconnected.
+local function test_disconnect_detaches_connection_finaliser()
+	local bus = Bus.new({ m_wild = '#', s_wild = '+' })
+	local scope = Scope.current()
+	local base = scope._finalisers:length()
+
+	for _ = 1, 1000 do
+		local conn = bus:connect()
+		assert_eq(scope._finalisers:length(), base + 1, 'connect should install one finaliser')
+		conn:disconnect()
+		assert_eq(scope._finalisers:length(), base, 'disconnect should detach its finaliser')
+	end
+
+	collectgarbage('collect')
+	assert_eq(scope._finalisers:length(), base, 'finaliser list should remain at baseline after GC')
+	assert_eq(bus:stats().connections, 0, 'all connections should be removed from bus stats')
+
+	print('Connection finaliser detachment test passed!')
+end
+
 --------------------------------------------------------------------------------
 -- Retained Message Tests
 --------------------------------------------------------------------------------
@@ -2352,6 +2381,7 @@ fibers.run(function ()
 	test_absence_via_deadline()
 	test_graceful_stop_signal()
 	test_conn_clean()
+	test_disconnect_detaches_connection_finaliser()
 
 	test_unsubscribe()
 
